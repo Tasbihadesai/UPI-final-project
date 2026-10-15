@@ -1,0 +1,38 @@
+2026-10-15 13:32:41  sms-app: opening Messages app for 6363349820
+2026-10-15 13:32:41  desktop: opening WhatsApp chat for 6363349820
+2026-10-15 13:32:54  desktop: pressed Enter (message should be sent)
+2026-10-15 13:32:54  sms-app: pressed Enter (message should be sent)
+2026-10-15 13:36:56  sms-app: opening Messages app for 6363349820
+2026-10-15 13:37:23  sms-app: pressed Enter (message should be sent)
+2026-10-15 13:37:27  desktop: opening WhatsApp chat for 6363349820
+2026-10-15 13:37:39  desktop: pressed Enter (message should be sent)
+2026-10-15 13:37:43  sms-app: opening Messages app for 8147996799
+2026-10-15 13:37:56  sms-app: pressed Enter (message should be sent)
+2026-10-15 13:38:00  desktop: opening WhatsApp chat for 8147996799
+2026-10-15 13:38:12  desktop: pressed Enter (message should be sent)
+2026-10-15 13:42:54  sms-app: opening Messages app for 6363349820
+2026-10-15 13:42:54  OK   To sender khalid: sms is being sent to 6363349820 through the Windows Messages app (Phone Link) - it needs your phone paired in Phone Link; don't touch the keyboard for ~15 seconds
+2026-10-15 13:42:54  OK   To sender khalid: whatsapp is being sent to 6363349820 through the WhatsApp desktop app - it will open and send by itself in ~10 seconds; don't click or type meanwhile
+2026-10-15 13:42:54  OK   To receiver 8147996799: sms is being sent to 8147996799 through the Windows Messages app (Phone Link) - it needs your phone paired in Phone Link; don't touch the keyboard for ~15 seconds
+2026-10-15 13:42:54  OK   To receiver 8147996799: whatsapp is being sent to 8147996799 through the WhatsApp desktop app - it will open and send by itself in ~10 seconds; don't click or type meanwhile
+2026-10-15 13:43:06  sms-app: pressed Enter (message should be sent)
+2026-10-15 13:43:10  desktop: opening WhatsApp chat for 6363349820
+2026-10-15 13:43:23  desktop: pressed Enter (message should be sent)
+2026-10-15 13:43:27  sms-app: opening Messages app for 8147996799
+2026-10-15 13:43:39  sms-app: pressed Enter (message should be sent)
+2026-10-15 13:43:43  desktop: opening WhatsApp chat for 8147996799
+2026-10-15 13:43:56  desktop: pressed Enter (message should be sent)
+2026-10-15 13:46:42  sms: not sent - FAST2SMS_KEY missing (apps are disabled)
+2026-10-15 13:46:42  whatsapp: not sent - Twilio keys missing (apps are disabled)
+2026-10-15 13:46:42  sms: not sent - FAST2SMS_KEY missing (apps are disabled)
+2026-10-15 13:46:42  whatsapp: not sent - Twilio keys missing (apps are disabled)
+2026-10-15 13:46:42  FAIL To sender tasbiha: sms not sent: add FAST2SMS_KEY in alert_config.json
+2026-10-15 13:46:42  FAIL To sender tasbiha: whatsapp not sent: add TWILIO_SID and TWILIO_TOKEN in alert_config.json
+2026-10-15 13:46:42  FAIL To receiver 8147996799: sms not sent: add FAST2SMS_KEY in alert_config.json
+2026-10-15 13:46:42  FAIL To receiver 8147996799: whatsapp not sent: add TWILIO_SID and TWILIO_TOKEN in alert_config.json
+2026-10-15 13:52:10  sms: not sent - FAST2SMS_KEY missing (apps are disabled)
+2026-10-15 13:52:10  whatsapp: not sent - Twilio keys missing (apps are disabled)
+2026-10-15 13:52:10  FAIL To sender swathi: no valid 10-digit phone saved for this user (save it in 'Alert contact details')
+2026-10-15 13:52:10  FAIL To sender swathi: no valid 10-digit phone saved for this user (save it in 'Alert contact details')
+2026-10-15 13:52:10  FAIL To receiver 8147996799: sms not sent: add FAST2SMS_KEY in alert_config.json
+2026-10-15 13:52:10  FAIL To receiver 8147996799: whatsapp not sent: add TWILIO_SID and TWILIO_TOKEN in alert_config.json

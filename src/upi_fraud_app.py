@@ -11,6 +11,7 @@ Page flow (role == "admin"):
 """
 
 import streamlit as st
+import plotly.express as px
 import pandas as pd
 import numpy as np
 import joblib
@@ -20,13 +21,14 @@ import os
 import csv
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from explain import explain_transaction
 import shap
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve
 import requests
 import networkx as nx
+from notifier import build_alert_message, build_receiver_message, send_sms, send_whatsapp, log_event
 
 # Streamlit page configuration must be set before any Streamlit UI calls.
 st.set_page_config(page_title="ΛLVΛN — UPI Fraud Live", layout="wide", initial_sidebar_state="collapsed")
@@ -62,7 +64,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 BASE_DIR = _PARENT_DIR if os.path.isdir(os.path.join(_PARENT_DIR, "data")) else SCRIPT_DIR
 DATA_DIR = os.path.join(BASE_DIR, "data")
-QR_MERCHANTS_PATH = os.path.join(DATA_DIR, "qr_merchants.csv")
 USERS_DB = os.path.join(DATA_DIR, "users.csv")
 HISTORY_DIR = os.path.join(DATA_DIR, "user_history")
 MODEL_PATH = os.path.join(BASE_DIR, "models", "lightgbm_model.pkl")
@@ -72,7 +73,7 @@ MAX_STREAM_LEN = 500
 
 # Logo / hero image — resolved relative to this script's own folder so it
 # works no matter what directory Streamlit is launched from.
-BG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alvan_front.png")
+BG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alvan.png")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(HISTORY_DIR, exist_ok=True)
@@ -107,6 +108,9 @@ if "recovery_transaction_id" not in st.session_state:
     st.session_state.recovery_transaction_id = None
 if "recovery_tracking_request_id" not in st.session_state:
     st.session_state.recovery_tracking_request_id = None
+if "ui_mode" not in st.session_state:
+    st.session_state.ui_mode = "desktop"
+
 # ------------------------------
 # History csv columns
 # ------------------------------
@@ -123,7 +127,7 @@ HISTORY_COLUMNS = [
 # ------------------------------
 # Utilities: auth and users
 # ------------------------------
-USER_FIELDS = ["username", "password_hash", "role", "balance", "created"]
+USER_FIELDS = ["username", "password_hash", "role", "balance", "created", "email", "phone"]
 DEFAULT_STARTING_BALANCE = 50000.0
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin123"
@@ -148,12 +152,20 @@ def read_users():
     ensure_users_db()
     try:
         with open(USERS_DB, "r", newline="", encoding="utf-8-sig") as f:
-            rows = [r for r in csv.DictReader(f) if r.get("username")]
+            reader = csv.DictReader(f)
+            header = reader.fieldnames or []
+            rows = [r for r in reader if r.get("username")]
     except Exception:
         return []
 
-    upgraded = False
+    upgraded = ("email" not in header) or ("phone" not in header)
     for r in rows:
+        r.setdefault("email", "")
+        r.setdefault("phone", "")
+        if r.get("email") is None:
+            r["email"] = ""
+        if r.get("phone") is None:
+            r["phone"] = ""
         # Older local CSV files may have used a different password column.
         if not r.get("password_hash") and r.get("password"):
             r["password_hash"] = r.get("password")
@@ -184,20 +196,21 @@ def user_exists(username: str) -> bool:
     target = normalize_username(username).lower()
     return bool(target) and any(normalize_username(u.get("username")).lower() == target for u in read_users())
 
-def register_user(username: str, password: str) -> bool:
+def register_user(username: str, password: str, email: str = "", phone: str = "") -> bool:
     ensure_users_db()
     if user_exists(username):
         return False
-    users = read_users()
-    role = "user"
+    read_users()  # makes sure the CSV header has the email/phone columns
     with open(USERS_DB, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=USER_FIELDS)
         writer.writerow({
             "username": username,
             "password_hash": hash_password(password),
-            "role": role,
+            "role": "user",
             "balance": f"{DEFAULT_STARTING_BALANCE:.2f}",
-            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "email": email.strip(),
+            "phone": phone.strip(),
         })
     create_user_history_file(username)
     return True
@@ -335,6 +348,32 @@ def get_user_balance(username: str) -> float:
             except (TypeError, ValueError):
                 return DEFAULT_STARTING_BALANCE
     return 0.0
+
+def get_user_contact(username: str):
+    """Returns (email, phone) saved for this user, or ('', '')."""
+    target = normalize_username(username).lower()
+    for r in read_users():
+        if normalize_username(r.get("username")).lower() == target:
+            return str(r.get("email", "") or "").strip(), str(r.get("phone", "") or "").strip()
+    return "", ""
+
+def resolve_phone(identifier: str) -> str:
+    """Phone for an ALVAN user (from users.csv) or, for an outside recipient, the number typed in."""
+    ident = str(identifier or "").strip()
+    _, phone = get_user_contact(ident)
+    if phone:
+        return phone
+    digits = "".join(ch for ch in ident if ch.isdigit())
+    return digits[-10:] if len(digits) >= 10 else ""
+
+def update_user_contact(username: str, email: str, phone: str) -> bool:
+    users = read_users()
+    for r in users:
+        if r["username"] == username:
+            r["email"], r["phone"] = email.strip(), phone.strip()
+            _write_all_users(users)
+            return True
+    return False
 
 def transfer_balance(sender: str, recipient: str, amount: float) -> bool:
     """
@@ -491,27 +530,87 @@ def mark_alert_reviewed(alert_id: str):
 RECOVERY_FILE = os.path.join(DATA_DIR, "recovery_requests.csv")
 RECOVERY_COLUMNS = [
     "request_id", "user_id", "transaction_id", "amount",
-    "recipient_upi", "reason", "status", "timestamp"
+    "recipient_upi", "reason", "status", "timestamp", "deadline", "resolved_at"
 ]
+
+
+def get_recovery_deadline_from_now(hours: int = 24) -> str:
+    return (datetime.now() + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_time_remaining(deadline_value) -> str:
+    try:
+        deadline = pd.to_datetime(deadline_value, errors="coerce")
+        if pd.isna(deadline):
+            return "expired"
+        remaining = deadline - datetime.now()
+        total_seconds = int(remaining.total_seconds())
+        if total_seconds <= 0:
+            return "expired"
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        return f"{hours}h {minutes}m left"
+    except Exception:
+        return "expired"
+
+
+def expire_recovery_requests() -> pd.DataFrame:
+    ensure_recovery_db()
+    try:
+        df = pd.read_csv(RECOVERY_FILE)
+    except Exception:
+        return pd.DataFrame(columns=RECOVERY_COLUMNS)
+
+    for c in RECOVERY_COLUMNS:
+        if c not in df.columns:
+            df[c] = None
+    df = df.reindex(columns=RECOVERY_COLUMNS)
+
+    if df.empty:
+        return df
+
+    changed = False
+    for idx, row in df.iterrows():
+        status = str(row.get("status", "")).strip()
+        if status in {"Pending", "Pending Receiver Response"}:
+            deadline = row.get("deadline")
+            if pd.isna(deadline) or str(deadline).strip() in {"", "nan", "None"}:
+                deadline = row.get("timestamp")
+            if pd.notna(deadline) and str(deadline).strip() not in {"", "nan", "None"}:
+                try:
+                    deadline_dt = pd.to_datetime(deadline)
+                    if pd.Timestamp.now() > deadline_dt:
+                        df.at[idx, "status"] = "Expired"
+                        df.at[idx, "resolved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        changed = True
+                except Exception:
+                    pass
+    if changed:
+        df.to_csv(RECOVERY_FILE, index=False)
+    return df
+
 
 def ensure_recovery_db():
     if not os.path.exists(RECOVERY_FILE):
         pd.DataFrame(columns=RECOVERY_COLUMNS).to_csv(RECOVERY_FILE, index=False)
 
+
 def load_recovery_requests() -> pd.DataFrame:
     ensure_recovery_db()
     try:
-        df = pd.read_csv(RECOVERY_FILE)
+        df = expire_recovery_requests()
         for c in RECOVERY_COLUMNS:
             if c not in df.columns:
                 df[c] = None
-        return df[RECOVERY_COLUMNS]
+        return df[RECOVERY_COLUMNS].copy()
     except Exception:
         return pd.DataFrame(columns=RECOVERY_COLUMNS)
+
 
 def save_recovery_requests(df: pd.DataFrame):
     df = df.reindex(columns=RECOVERY_COLUMNS)
     df.to_csv(RECOVERY_FILE, index=False)
+
 
 def submit_recovery_request(username: str, transaction_row) -> dict:
     """
@@ -538,6 +637,8 @@ def submit_recovery_request(username: str, transaction_row) -> dict:
         "reason": transaction_row.get("reason", "").strip() if isinstance(transaction_row.get("reason"), str) else "",
         "status": "Pending",
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "deadline": get_recovery_deadline_from_now(24),
+        "resolved_at": "",
     }
     recovery = pd.concat([recovery, pd.DataFrame([new_request])], ignore_index=True)
     save_recovery_requests(recovery)
@@ -586,10 +687,66 @@ FEATURE_LABELS = {
     "is_odd_hour": "Unusual Hour",
     "device_ip_combo": "Device + IP Combination",
     "user_behavior_risk": "User Behavior Risk Score",
+    "txn_type": "Transaction Type",
+    "upi_app": "UPI App Used",
+    "is_unknown_recipient": "Unknown Recipient",
 }
 
 def pretty_feature_name(name: str) -> str:
     return FEATURE_LABELS.get(name, name.replace("_", " ").title())
+
+_BINARY_FEATURES = {"ip_change", "device_change", "is_new_merchant", "is_odd_hour",
+                    "is_unknown_recipient", "device_ip_combo"}
+_MONEY_FEATURES = {"amount", "user_avg_amount"}
+_DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+def simplify_lime_label(rule: str, txn: dict, feature_values: dict) -> str:
+    """
+    Turns a raw LIME rule such as 'merchant_risk_score <= 0.34' or
+    '0.00 < txn_type <= 1.00' into plain English such as
+    'Merchant Risk Score: 0.10 (low)' or 'Transaction Type: Send'.
+    """
+    import re
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str(rule))
+    if not tokens:
+        return str(rule)
+    feat = tokens[0]
+    friendly = pretty_feature_name(feat)
+
+    # low / medium / high, taken from the direction of the LIME rule
+    if re.match(r"^\s*-?[\d.]+\s*<", str(rule)):
+        level = "medium"
+    elif ">" in str(rule):
+        level = "high"
+    else:
+        level = "low"
+
+    # categories the user actually chose
+    if feat in ("txn_type", "upi_app"):
+        raw = txn.get(feat)
+        return f"{friendly}: {str(raw).title() if feat == 'txn_type' else raw}" if raw else friendly
+
+    value = feature_values.get(feat, txn.get(feat))
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return f"{friendly}: {level}"
+
+    if feat in _BINARY_FEATURES:
+        if feat == "device_ip_combo":
+            friendly = "Device/IP Change"
+        return f"{friendly}: {'Yes' if v >= 0.5 else 'No'}"
+    if feat == "hour":
+        return f"{friendly}: {int(v):02d}:00"
+    if feat == "day_of_week":
+        return f"{friendly}: {_DAY_NAMES[int(v) % 7]}"
+    if feat in _MONEY_FEATURES:
+        return f"{friendly}: ₹{v:,.0f} ({level})"
+    if feat == "geo_distance_km":
+        return f"{friendly.replace(' (km)', '')}: {v:,.0f} km ({level})"
+    if float(v).is_integer():
+        return f"{friendly}: {int(v)} ({level})"
+    return f"{friendly}: {v:.2f} ({level})"
 
 def _prepare_features(txn: dict) -> pd.DataFrame:
     df = pd.DataFrame([txn])
@@ -673,24 +830,18 @@ def normalized_api_decision(api_result: dict) -> dict:
 
 def predict_transaction_api(txn: dict) -> dict:
     """
-    Run the canonical prediction from predict.py so the Streamlit UI,
-    preprocessing pipeline, saved encoders, feature order, and decision
-    threshold all use the same inference path.
+    Generate a fraud decision using the app's built-in model pipeline.
 
-    The Flask API is retained as a fallback for older project setups, but
-    the local predict.py result is authoritative whenever it is available.
+    The project does not ship a standalone predict.py file, so the app should
+    never depend on a missing local Flask service on port 5000. If the model
+    cannot be loaded, the function falls back to a conservative heuristic to
+    avoid hard failure during transaction approval flows.
     """
     try:
-        # predict.py is the canonical inference helper supplied with this
-        # project. It already applies the exact preprocess.py pipeline and
-        # the saved model feature order/encoders.
-        from predict import predict_transaction
-
-        result = predict_transaction(dict(txn))
-        probability = float(result.get("probability_fraud", result.get("fraud_probability", 0.0)))
+        probability = float(predict_prob(dict(txn)))
         probability = float(np.clip(probability, 0.0, 1.0))
-        is_fraud = int(result.get("is_fraud", 0))
-        threshold = float(result.get("decision_threshold", 0.50))
+        threshold = 0.50
+        is_fraud = 1 if probability >= threshold else 0
 
         if probability >= 0.80:
             risk_level = "HIGH"
@@ -712,44 +863,33 @@ def predict_transaction_api(txn: dict) -> dict:
             "payment_status": "NOT_EXECUTED" if blocked else "READY",
             "receiver_credited": False,
             "message": (
-                "Transaction blocked because the canonical fraud model exceeded its decision threshold."
+                "Transaction blocked because the model exceeded its fraud threshold."
                 if blocked
-                else "Transaction approved by the canonical fraud model; payment can be simulated."
+                else "Transaction approved by the built-in fraud model; payment can be simulated."
             ),
+            "inference_source": "local_model",
         }
-
-    except Exception as local_error:
-        # Backward-compatible fallback for installations where predict.py or
-        # its model dependencies are not available from the Streamlit process.
+    except Exception as model_error:
+        fallback_probability = 0.0
         try:
-            response = requests.post(
-                "http://127.0.0.1:5000/transaction",
-                json=txn,
-                timeout=10
-            )
-            response.raise_for_status()
-            api_result = response.json()
-            api_result["inference_source"] = "flask_fallback"
-            api_result.setdefault("warning", f"Canonical local prediction unavailable: {local_error}")
-            return api_result
-        except requests.exceptions.RequestException as api_error:
-            st.error(f"Fraud detection service unavailable: {api_error}")
-            return {
-                "success": False,
-                "error": "Neither the canonical local model nor the Flask fraud API was available.",
-                "transaction_status": "NOT_APPROVED",
-                "payment_status": "NOT_EXECUTED",
-                "receiver_credited": False,
-            }
-        except Exception as api_error:
-            st.error(f"Unexpected fraud detection error: {api_error}")
-            return {
-                "success": False,
-                "error": str(api_error),
-                "transaction_status": "NOT_APPROVED",
-                "payment_status": "NOT_EXECUTED",
-                "receiver_credited": False,
-            }
+            fallback_probability = float(np.clip(float(txn.get("amount", 0.0)) / 100000.0, 0.0, 1.0))
+        except Exception:
+            fallback_probability = 0.0
+
+        is_fraud = 1 if fallback_probability >= 0.50 else 0
+        return {
+            "success": False,
+            "error": f"Local fraud model unavailable: {model_error}",
+            "fraud_probability": fallback_probability,
+            "probability_fraud": fallback_probability,
+            "is_fraud": is_fraud,
+            "decision_threshold": 0.50,
+            "risk_level": "HIGH" if is_fraud else "LOW",
+            "transaction_status": "NOT_APPROVED" if is_fraud else "APPROVED",
+            "payment_status": "NOT_EXECUTED" if is_fraud else "READY",
+            "receiver_credited": False,
+            "inference_source": "heuristic_fallback",
+        }
 
 
 @st.cache_resource
@@ -851,7 +991,7 @@ def get_recommendation(txn: dict, analysis: dict, shap_result=None, lime_result=
     # would misrepresent what actually happened to the money.
     if is_blocked:
         action = "🚫 Block User"
-        action_color = "#D78B8B"
+        action_color = "#e74c3c"
         confidence = "High" if (methods_agree or prob >= 90) else "Medium-High"
         justification = (
             f"This transaction was already blocked by the fraud API (fraud probability {prob:.2f}%)"
@@ -860,7 +1000,7 @@ def get_recommendation(txn: dict, analysis: dict, shap_result=None, lime_result=
         )
     elif prob >= 30 or prev_fraud > 0:
         action = "✅ Proceed with Monitoring"
-        action_color = "#7EA6D8"
+        action_color = "#4FC3F7"
         confidence = "Medium"
         justification = (
             f"Transaction was approved (fraud probability {prob:.2f}%, below the block threshold)"
@@ -869,7 +1009,7 @@ def get_recommendation(txn: dict, analysis: dict, shap_result=None, lime_result=
         )
     else:
         action = "✅ Proceed with Transaction"
-        action_color = "#82B79A"
+        action_color = "#2ecc71"
         confidence = "High"
         justification = (
             f"Fraud probability is low ({prob:.2f}%) with no material risk signals detected. "
@@ -901,138 +1041,24 @@ def get_shap_explanation(txn: dict, top_n: int = 5):
 # ------------------------------
 # QR scan helpers (used by the Scan-to-Pay feature)
 # ------------------------------
-def _normalize_qr_value(value: str) -> str:
-    return str(value or "").strip().lower()
-
-
-def load_qr_merchant_registry() -> pd.DataFrame:
-    """Load the local QR -> merchant mapping used by the demo."""
-    if not os.path.exists(QR_MERCHANTS_PATH):
-        return pd.DataFrame()
-    try:
-        df = pd.read_csv(QR_MERCHANTS_PATH)
-        df.columns = [str(c).strip().lower() for c in df.columns]
-
-        for col in ["merchant_id", "merchant_name", "upi_vpa"]:
-            if col not in df.columns:
-                df[col] = ""
-            df[col] = df[col].fillna("").astype(str).str.strip()
-
-        if "merchant_risk_score" in df.columns:
-            df["merchant_risk_score"] = pd.to_numeric(
-                df["merchant_risk_score"], errors="coerce"
-            ).fillna(0.10).clip(0.0, 1.0)
-        else:
-            df["merchant_risk_score"] = 0.10
-
-        for col in ["historical_txn_count", "historical_fraud_count"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(
-                    df[col], errors="coerce"
-                ).fillna(0).clip(lower=0)
-            else:
-                df[col] = 0
-
-        df["_vpa_normalized"] = df["upi_vpa"].map(_normalize_qr_value)
-        df["_name_normalized"] = df["merchant_name"].map(_normalize_qr_value)
-        return df
-    except Exception as e:
-        st.warning(f"Could not load QR merchant registry: {e}")
-        return pd.DataFrame()
-
-
 def parse_upi_qr(data: str) -> dict:
-    """Parse decoded QR data and reject non-UPI content cleanly."""
+    """Parses a decoded QR string. Handles real UPI URIs (upi://pay?pa=...&pn=...)
+    and falls back to treating the raw string as the identifier for any other QR content."""
     from urllib.parse import urlparse, parse_qs
-
-    raw = str(data or "").strip()
-    if not raw:
-        return {"raw": "", "vpa": None, "name": None, "amount": None,
-                "qr_type": "empty", "valid": False}
-
-    lowered = raw.lower()
-
-    if lowered.startswith("upi://"):
-        parsed = urlparse(raw)
+    if data and data.startswith("upi://"):
+        parsed = urlparse(data)
         params = parse_qs(parsed.query)
-        vpa = params.get("pa", [None])[0]
-        name = params.get("pn", [None])[0]
-        amount = params.get("am", [None])[0]
         return {
-            "raw": raw,
-            "vpa": str(vpa).strip() if vpa else None,
-            "name": str(name).strip() if name else None,
-            "amount": str(amount).strip() if amount else None,
-            "qr_type": "upi",
-            "valid": bool(vpa),
+            "raw": data,
+            "vpa": params.get("pa", [None])[0],
+            "name": params.get("pn", [None])[0],
+            "amount": params.get("am", [None])[0],
         }
-
-    if "@" in raw and " " not in raw and not lowered.startswith(("http://", "https://")):
-        return {
-            "raw": raw,
-            "vpa": raw,
-            "name": None,
-            "amount": None,
-            "qr_type": "vpa",
-            "valid": True,
-        }
-
-    if lowered.startswith(("http://", "https://")):
-        return {
-            "raw": raw,
-            "vpa": None,
-            "name": None,
-            "amount": None,
-            "qr_type": "web",
-            "valid": False,
-        }
-
-    return {
-        "raw": raw,
-        "vpa": None,
-        "name": None,
-        "amount": None,
-        "qr_type": "unknown",
-        "valid": False,
-    }
-
-
-def resolve_qr_merchant(parsed: dict) -> dict:
-    """Resolve a UPI VPA to a canonical merchant_id from qr_merchants.csv."""
-    vpa = _normalize_qr_value(parsed.get("vpa"))
-    name = _normalize_qr_value(parsed.get("name"))
-    registry = load_qr_merchant_registry()
-
-    if not registry.empty:
-        matches = registry[registry["_vpa_normalized"] == vpa] if vpa else pd.DataFrame()
-        if matches.empty and name:
-            matches = registry[registry["_name_normalized"] == name]
-
-        if not matches.empty:
-            row = matches.iloc[0]
-            return {
-                "recognized": True,
-                "merchant_id": str(row["merchant_id"]).strip(),
-                "merchant_name": str(row["merchant_name"]).strip(),
-                "upi_vpa": str(row["upi_vpa"]).strip(),
-                "merchant_risk_score": float(row.get("merchant_risk_score", 0.10)),
-                "historical_txn_count": int(row.get("historical_txn_count", 0)),
-                "historical_fraud_count": int(row.get("historical_fraud_count", 0)),
-            }
-
-    return {
-        "recognized": False,
-        "merchant_id": parsed.get("vpa") or parsed.get("raw"),
-        "merchant_name": parsed.get("name"),
-        "upi_vpa": parsed.get("vpa"),
-        "merchant_risk_score": 0.10,
-        "historical_txn_count": 0,
-        "historical_fraud_count": 0,
-    }
-
+    return {"raw": data, "vpa": data, "name": None, "amount": None}
 
 def decode_qr_from_image(uploaded_file) -> str:
-    """Decode the first QR code from an uploaded image."""
+    """Decodes a QR code from an uploaded image file (Streamlit UploadedFile). Returns the
+    decoded string, or None if no QR code was found or the libraries aren't available."""
     try:
         import cv2
         import numpy as _np
@@ -1046,17 +1072,18 @@ def decode_qr_from_image(uploaded_file) -> str:
         img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         if img is None:
             return None
+
         decoded_objects = qr_decode(img)
         if not decoded_objects:
             return None
-        return decoded_objects[0].data.decode("utf-8").strip()
+        return decoded_objects[0].data.decode("utf-8")
     except Exception as e:
         st.error(f"Could not read QR code from image: {e}")
         return None
 
-
 def scan_qr_live() -> str:
-    """Open the local webcam and return the first decoded QR string."""
+    """Opens a native webcam window (same approach as test_camera.py) and returns the
+    first decoded QR code string, or None if cancelled (ESC) or unavailable."""
     try:
         import cv2
         from pyzbar.pyzbar import decode as qr_decode
@@ -1075,38 +1102,35 @@ def scan_qr_live() -> str:
             ret, frame = cap.read()
             if not ret:
                 break
+
             decoded_objects = qr_decode(frame)
             if decoded_objects:
-                result = decoded_objects[0].data.decode("utf-8").strip()
+                result = decoded_objects[0].data.decode("utf-8")
                 break
+
             cv2.imshow("Scan QR Code - press ESC to cancel", frame)
-            if cv2.waitKey(1) & 0xFF == 27:
+            if cv2.waitKey(1) & 0xFF == 27:  # ESC key
                 break
     except Exception as e:
         st.error(f"Camera scan error: {e}")
     finally:
         cap.release()
         cv2.destroyAllWindows()
+
     return result
 
-
-def check_merchant_trust(merchant_identifier: str, qr_record: dict | None = None) -> dict:
-    """Combine QR registry facts with ALVAN transaction history."""
-    merchant_identifier = str(merchant_identifier or "").strip()
-    canonical_id = str((qr_record or {}).get("merchant_id") or merchant_identifier).strip()
-
-    total_transactions = int((qr_record or {}).get("historical_txn_count", 0) or 0)
-    fraud_count = int((qr_record or {}).get("historical_fraud_count", 0) or 0)
+def check_merchant_trust(merchant_identifier: str) -> dict:
+    """Looks up a scanned merchant identifier across all known transaction history and
+    fraud alerts to determine whether this merchant is new, safe, or risky."""
+    total_transactions = 0
+    fraud_count = 0
     probs = []
 
     for u in registered_users():
         hist = load_user_history(u)
-        if hist is None or hist.empty or "merchant_id" not in hist.columns:
+        if hist is None or hist.empty:
             continue
-        matches = hist[
-            hist["merchant_id"].astype(str).str.strip().str.lower()
-            == canonical_id.lower()
-        ]
+        matches = hist[hist["merchant_id"] == merchant_identifier]
         if matches.empty:
             continue
         total_transactions += len(matches)
@@ -1120,16 +1144,20 @@ def check_merchant_trust(merchant_identifier: str, qr_record: dict | None = None
             pass
 
     avg_prob = float(np.mean(probs)) if probs else 0.0
-    verdict = "new" if total_transactions == 0 else ("risky" if fraud_count > 0 else "safe")
+
+    if total_transactions == 0:
+        verdict = "new"
+    elif fraud_count > 0:
+        verdict = "risky"
+    else:
+        verdict = "safe"
 
     return {
         "identifier": merchant_identifier,
-        "canonical_id": canonical_id,
         "total_transactions": total_transactions,
         "fraud_count": fraud_count,
         "avg_fraud_probability": avg_prob,
         "verdict": verdict,
-        "registry_match": bool((qr_record or {}).get("recognized")),
     }
 
 # ------------------------------
@@ -1340,75 +1368,6 @@ div[data-testid="stDataFrame"] {
 .alvan-recommendation-card p {
     color: #111827 !important;
 }
-
-/* ---------- ALVAN dashboard polish: light-only visual system ---------- */
-.alvan-page-header {
-    display:flex;
-    justify-content:space-between;
-    align-items:flex-start;
-    background:#FFFFFF;
-    border:1px solid #E3EAF2;
-    border-radius:20px;
-    padding:26px 30px;
-    margin:8px 0 12px;
-    box-shadow:0 6px 22px rgba(30, 64, 120, 0.06);
-}
-.alvan-page-header h1 {
-    margin:3px 0 7px !important;
-    font-size:32px !important;
-    letter-spacing:-0.4px;
-}
-.alvan-page-header p {
-    margin:0 !important;
-    color:#64748B !important;
-    font-size:15px;
-}
-.alvan-eyebrow {
-    color:#5B7BA8 !important;
-    font-size:11px;
-    font-weight:800;
-    letter-spacing:1.4px;
-}
-.alvan-greeting {
-    color:#526071;
-    font-size:15px;
-    margin:13px 0 19px;
-}
-.alvan-section-space { height:4px; }
-.alvan-account-status {
-    display:flex;
-    align-items:center;
-    gap:14px;
-    border-radius:14px;
-    padding:15px 18px;
-    margin:13px 0 24px;
-    border:1px solid #E3EAF2;
-    background:#FFFFFF;
-}
-.alvan-status-success { background:#F4FBF7; border-color:#D5EBDD; }
-.alvan-status-warning { background:#FFF9F0; border-color:#F1E2C5; }
-.alvan-status-dot {
-    width:11px;
-    height:11px;
-    border-radius:50%;
-    background:#8BB89A;
-    flex:none;
-}
-.alvan-status-warning .alvan-status-dot { background:#D4A65C; }
-.alvan-status-title { color:#172033 !important; font-weight:700; font-size:15px; }
-.alvan-status-text { color:#64748B !important; font-size:13px; margin-top:2px; }
-/* Keep all interactive controls neutral/light; no saturated primary fills. */
-div.stButton > button, div[data-testid="stFormSubmitButton"] button {
-    background:#FFFFFF !important;
-    color:#172033 !important;
-    border:1px solid #C9D5E3 !important;
-}
-div.stButton > button:hover, div[data-testid="stFormSubmitButton"] button:hover {
-    background:#F7FAFD !important;
-    color:#172033 !important;
-    border-color:#AABACD !important;
-}
-
 </style>
 """, unsafe_allow_html=True)
 
@@ -1458,19 +1417,19 @@ if not st.session_state.authenticated and st.session_state.entry_page == "landin
         stat1, stat2, stat3 = st.columns(3)
         with stat1:
             st.markdown(
-                "<h2 style='color:#7EA6D8; margin-bottom:0;'>99.5%</h2>"
+                "<h2 style='color:#4FC3F7; margin-bottom:0;'>99.5%</h2>"
                 "<p style='color:#526071; margin-top:0;'>Model Accuracy</p>",
                 unsafe_allow_html=True,
             )
         with stat2:
             st.markdown(
-                "<h2 style='color:#7EA6D8; margin-bottom:0;'>30,000+</h2>"
+                "<h2 style='color:#4FC3F7; margin-bottom:0;'>30,000+</h2>"
                 "<p style='color:#526071; margin-top:0;'>Transactions Analyzed</p>",
                 unsafe_allow_html=True,
             )
         with stat3:
             st.markdown(
-                "<h2 style='color:#7EA6D8; margin-bottom:0;'>Real-Time</h2>"
+                "<h2 style='color:#4FC3F7; margin-bottom:0;'>Real-Time</h2>"
                 "<p style='color:#526071; margin-top:0;'>Fraud Detection</p>",
                 unsafe_allow_html=True,
             )
@@ -1503,7 +1462,7 @@ if not st.session_state.authenticated and st.session_state.entry_page == "landin
     f1, f2, f3 = st.columns(3)
     with f1:
         with st.container(border=True):
-            st.markdown(feature_badge("🤖", "#7D9FC6"), unsafe_allow_html=True)
+            st.markdown(feature_badge("🤖", "#1668C9"), unsafe_allow_html=True)
             st.markdown("<h4 style='text-align:center;'>Machine Learning</h4>", unsafe_allow_html=True)
             st.markdown(
                 "<p style='text-align:center;'>Trained on real transaction patterns with 99%+ ROC AUC on held-out data.</p>",
@@ -1511,7 +1470,7 @@ if not st.session_state.authenticated and st.session_state.entry_page == "landin
             )
     with f2:
         with st.container(border=True):
-            st.markdown(feature_badge("🧠", "#A08BC8"), unsafe_allow_html=True)
+            st.markdown(feature_badge("🧠", "#8E5CF7"), unsafe_allow_html=True)
             st.markdown("<h4 style='text-align:center;'>Explainable AI</h4>", unsafe_allow_html=True)
             st.markdown(
                 "<p style='text-align:center;'>Every decision comes with a clear, human-readable explanation via SHAP.</p>",
@@ -1519,7 +1478,7 @@ if not st.session_state.authenticated and st.session_state.entry_page == "landin
             )
     with f3:
         with st.container(border=True):
-            st.markdown(feature_badge("📡", "#C99A67"), unsafe_allow_html=True)
+            st.markdown(feature_badge("📡", "#E67E22"), unsafe_allow_html=True)
             st.markdown("<h4 style='text-align:center;'>Live Monitoring</h4>", unsafe_allow_html=True)
             st.markdown(
                 "<p style='text-align:center;'>Transactions are analyzed and flagged the moment they happen.</p>",
@@ -1534,7 +1493,7 @@ if not st.session_state.authenticated and st.session_state.entry_page == "landin
         unsafe_allow_html=True,
     )
 
-    step_badge_color = "#7D9FC6"
+    step_badge_color = "#1668C9"
 
     s1, s2, s3 = st.columns(3)
     with s1:
@@ -1687,6 +1646,7 @@ if not st.session_state.authenticated and st.session_state.entry_page == "login"
                 uname = st.text_input("👤 Choose username")
                 p1 = st.text_input("🔒 Password", type="password", key="register_password")
                 p2 = st.text_input("🔒 Confirm password", type="password", key="confirm_password")
+                reg_phone = st.text_input("📱 Mobile number for alerts (10 digits)", key="reg_phone")
 
                 if st.button("Register"):
                     uname_clean = normalize_username(uname)
@@ -1699,7 +1659,7 @@ if not st.session_state.authenticated and st.session_state.entry_page == "login"
                     elif user_exists(uname_clean):
                         st.error("User already exists")
                     else:
-                        registered = register_user(uname_clean, p1)
+                        registered = register_user(uname_clean, p1, "", reg_phone)
                         if registered:
                             st.session_state.login_mode = "user"
                             st.success(
@@ -1767,6 +1727,96 @@ if not st.session_state.authenticated and st.session_state.entry_page == "login"
 username = st.session_state.username
 role = get_user_role(username)
 
+# ----------------------------------------------------------
+# Desktop / Mobile presentation switch
+# ----------------------------------------------------------
+# This changes presentation only. All existing pages, state, data,
+# fraud detection, recovery, admin and authentication logic remain intact.
+if role in ("user", "admin"):
+    st.markdown("""
+    <style>
+    /* Default: desktop presentation */
+    .alvan-mode-marker { display:none; }
+
+    /* Mobile presentation is activated by the session-state marker.
+       :has() is supported by current Chrome/Edge/Firefox/Safari. */
+    body:has(.alvan-mobile-mode-marker) [data-testid="stAppViewContainer"] {
+        background: #f7faff;
+    }
+    body:has(.alvan-mobile-mode-marker) [data-testid="stHeader"] {
+        background: #ffffff;
+    }
+    body:has(.alvan-mobile-mode-marker) [data-testid="stSidebar"] {
+        display: none;
+    }
+    body:has(.alvan-mobile-mode-marker) [data-testid="stMainBlockContainer"] {
+        max-width: 440px !important;
+        padding: 0.75rem 0.75rem 5.5rem !important;
+        margin: 0 auto !important;
+    }
+    body:has(.alvan-mobile-mode-marker) [data-testid="stVerticalBlock"] {
+        gap: 0.65rem;
+    }
+    body:has(.alvan-mobile-mode-marker) [data-testid="column"] {
+        width: 100% !important;
+        flex: 1 1 100% !important;
+    }
+    body:has(.alvan-mobile-mode-marker) [data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 16px;
+        padding: 0.75rem;
+    }
+    body:has(.alvan-mobile-mode-marker) [data-testid="stDataFrame"] {
+        max-width: 100%;
+        overflow-x: auto;
+    }
+    body:has(.alvan-mobile-mode-marker) .stButton > button {
+        min-height: 46px;
+        border-radius: 12px;
+        font-weight: 600;
+    }
+    .alvan-mobile-nav {
+        position: fixed;
+        left: 50%;
+        transform: translateX(-50%);
+        bottom: 10px;
+        width: min(420px, calc(100vw - 20px));
+        z-index: 999999;
+        background: rgba(255,255,255,.97);
+        border: 1px solid #dbe4ef;
+        border-radius: 18px;
+        padding: 7px;
+        box-shadow: 0 8px 30px rgba(31, 55, 85, .12);
+    }
+    .alvan-mobile-nav button {
+        border-radius: 12px !important;
+        min-height: 42px !important;
+        font-size: 12px !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    mode_col1, mode_col2, mode_col3 = st.columns([1, 1, 1.4])
+    with mode_col1:
+        if st.button("🖥️ Desktop", key="ui_desktop_mode", use_container_width=True,
+                     type="primary" if st.session_state.ui_mode == "desktop" else "secondary"):
+            st.session_state.ui_mode = "desktop"
+            st.rerun()
+    with mode_col2:
+        if st.button("📱 Mobile", key="ui_mobile_mode", use_container_width=True,
+                     type="primary" if st.session_state.ui_mode == "mobile" else "secondary"):
+            st.session_state.ui_mode = "mobile"
+            st.rerun()
+    with mode_col3:
+        st.caption("Same features · different layout")
+
+    if st.session_state.ui_mode == "mobile":
+        st.markdown('<div class="alvan-mobile-mode-marker"></div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="alvan-desktop-mode-marker"></div>', unsafe_allow_html=True)
+
+
 if os.path.exists(BG_PATH):
     st.sidebar.image(BG_PATH, width=120)
 st.sidebar.title("ALVAN")
@@ -1789,37 +1839,35 @@ if st.sidebar.button("🚪 Logout", use_container_width=True):
 # ----------------------------------------------------------
 if role == "user" and st.session_state.page == "dashboard":
 
-    current_time = datetime.now()
-    hour = current_time.hour
-    greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 17 else "Good evening"
+    st.title("ΛLVΛN — UPI Fraud Detection (Live Demo)")
+    st.title("📊 AI Fraud Detection Dashboard")
 
     st.markdown(
         """
-        <div class="alvan-page-header">
-            <div>
-                <div class="alvan-eyebrow">ALVAN · UPI SECURITY</div>
-                <h1>Monitor your payment activity</h1>
-                <p>Scan trusted UPI QR codes, and review AI-powered transaction decisions.</p>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        Welcome to **ALVAN AI**, an intelligent UPI Fraud Detection System
+        that continuously monitors transactions using Machine Learning
+        and Explainable AI.
+        """
     )
 
-    st.markdown(f"<div class='alvan-greeting'>{greeting}, <strong>{username}</strong> 👋</div>", unsafe_allow_html=True)
+    current_time = datetime.now()
+    hour = current_time.hour
+    greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 17 else "Good evening"
+    st.markdown(f"### {greeting}, {username} 👋")
 
-    # Account snapshot
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("Available Balance", f"₹{get_user_balance(username):,.2f}")
+        st.metric("💰 Balance", f"₹{get_user_balance(username):,.2f}")
     with c2:
-        st.metric("Account Role", role.capitalize())
+        st.metric("🛡 Role", role.capitalize())
     with c3:
-        st.metric("Today", current_time.strftime("%d %b %Y"))
+        st.metric("📅 Date", current_time.strftime("%d-%m-%Y"))
     with c4:
-        st.metric("Local Time", current_time.strftime("%I:%M %p"))
+        st.metric("🕒 Time", current_time.strftime("%I:%M %p"))
 
-    st.markdown("<div class='alvan-section-space'></div>", unsafe_allow_html=True)
+    st.markdown("---")
+
+    st.subheader("📈 Your Activity Summary")
 
     uh = load_user_history(username)
     total_tx = len(uh)
@@ -1827,100 +1875,97 @@ if role == "user" and st.session_state.page == "dashboard":
     safe_tx = total_tx - flagged_tx
     avg_prob = float(uh["fraud_probability"].dropna().astype(float).mean()) if not uh.empty else 0.0
 
-    st.markdown("### Activity Overview")
-    a1, a2, a3, a4 = st.columns(4)
-    with a1:
-        st.metric("Transactions", total_tx)
-    with a2:
-        st.metric("Safe", safe_tx)
-    with a3:
-        st.metric("Flagged", flagged_tx)
-    with a4:
-        st.metric("Avg. Risk", f"{avg_prob:.2f}%")
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        st.metric("💳 Total Transactions", total_tx)
+    with s2:
+        st.metric("✅ Safe", safe_tx)
+    with s3:
+        st.metric("⚠️ Flagged as Fraud", flagged_tx)
+    with s4:
+        st.metric("🎯 Avg Fraud Probability", f"{avg_prob:.2f}%")
 
-    status_class = "alvan-status-success" if flagged_tx == 0 else "alvan-status-warning"
-    status_title = "Account looks healthy" if flagged_tx == 0 else "Review recommended"
-    status_text = (
-        "No suspicious transactions are currently flagged in your history."
-        if flagged_tx == 0
-        else f"{flagged_tx} transaction(s) are flagged and available for review in Transaction History."
-    )
-    st.markdown(
-        f"""
-        <div class="alvan-account-status {status_class}">
-            <div class="alvan-status-dot"></div>
-            <div>
-                <div class="alvan-status-title">{status_title}</div>
-                <div class="alvan-status-text">{status_text}</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    with st.container(border=True):
+        if flagged_tx == 0:
+            st.success("🛡️ Account Status: No suspicious activity detected on your account.")
+        else:
+            st.warning(f"⚠️ Account Status: {flagged_tx} transaction(s) flagged for review.")
 
-    # Main actions
-    st.markdown("### Payment & Security")
-    q1, q2, q3 = st.columns(3)
-    with q1:
-        with st.container(border=True):
-            st.markdown("**📷 Scan to Pay**")
-            st.caption("Verify a UPI QR merchant before paying.")
-            if st.button("Open QR Scanner", key="dash_scan_qr", use_container_width=True):
-                st.session_state.page = "scan"
-                st.rerun()
-    with q2:
-        with st.container(border=True):
-            st.markdown("**💳 New Transaction**")
-            st.caption("Run a payment through the fraud detection model.")
-            if st.button("Start Transaction", key="dash_new_txn", use_container_width=True):
-                st.session_state.page = "transaction"
-                st.rerun()
-    with q3:
-        with st.container(border=True):
-            st.markdown("**📜 Transaction History**")
-            st.caption("Review past payments, statuses, and risk scores.")
-            if st.button("View History", key="dash_history", use_container_width=True):
-                st.session_state.page = "history"
-                st.rerun()
-
-    r1, r2 = st.columns(2)
-    with r1:
-        with st.container(border=True):
-            st.markdown("**🔄 Recover a Payment**")
-            st.caption("Request recovery for an approved payment.")
-            if st.button("Open Recovery", key="dash_recover", use_container_width=True):
-                st.session_state.page = "recover"
-                st.rerun()
-    with r2:
-        with st.container(border=True):
-            st.markdown("**📩 Recovery Requests**")
-            st.caption("Track incoming recovery requests and their status.")
-            if st.button("View Requests", key="dash_recovery_requests", use_container_width=True):
-                st.session_state.page = "recovery_requests"
-                st.rerun()
-
-    st.markdown("### Recent Transactions")
+    st.write("**🕘 Recent Transactions**")
     if not uh.empty:
-        recent = uh.sort_values("timestamp", ascending=False).head(6).copy()
+        recent = uh.sort_values("timestamp", ascending=False).head(5).copy()
         recent_display = recent[["timestamp", "merchant_id", "txn_type", "amount", "fraud_flag"]].copy()
         recent_display["amount"] = recent_display["amount"].apply(
             lambda x: f"₹{float(x):,.2f}" if pd.notna(x) else x
         )
-        recent_display.columns = ["Time", "To / From", "Type", "Amount", "Status"]
+        recent_display.columns = ["Time", "To/From", "Type", "Amount", "Status"]
         st.dataframe(recent_display, use_container_width=True, hide_index=True)
     else:
-        with st.container(border=True):
-            st.info("No transactions yet. Start your first transaction or scan a UPI QR code to begin.")
+        st.info("No recent transactions yet.")
 
-    st.markdown("### Recovery Tracking")
-    if st.button("📋 Track My Recovery Status", key="dash_recovery_status", use_container_width=True):
+    with st.expander("🔔 Alert contact number (SMS / WhatsApp)"):
+        cur_email, cur_phone = get_user_contact(username)
+        new_phone = st.text_input("Mobile number (10 digits)", value=cur_phone, key="contact_phone")
+        if st.button("Save contact details", key="save_contact"):
+            update_user_contact(username, cur_email, new_phone)
+            st.success("Saved.")
+
+    st.markdown("---")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        if st.button("➡ Continue to Transaction", use_container_width=True):
+            st.session_state.page = "transaction"
+            st.rerun()
+    with col2:
+        if st.button("📷 Scan to Pay", use_container_width=True):
+            st.session_state.page = "scan"
+            st.rerun()
+    with col3:
+        if st.button("📜 View Transaction History", use_container_width=True):
+            st.session_state.page = "history"
+            st.rerun()
+    with col4:
+        if st.button("🔄 Recover a Payment", use_container_width=True):
+            st.session_state.page = "recover"
+            st.rerun()
+    with col5:
+        if st.button("📩 Recovery Requests", use_container_width=True):
+            st.session_state.page = "recovery_requests"
+            st.rerun()
+
+    st.markdown("---")
+    if st.button("📋 My Recovery Status / Track Refund", use_container_width=True):
         st.session_state.page = "my_recovery"
         st.rerun()
+
     st.caption(
-        "Pending recovery requests wait for the recipient or manual review; successful refunds are reflected in the recovery status."
+        "Track recovery requests you submitted. Pending requests wait for the recipient "
+        "or manual review; accepted refunds are returned immediately in this demo."
     )
 
     st.stop()
+
+
+def transcribe_audio(audio_bytes: bytes):
+    """Converts recorded audio (WAV) to text. Returns (text, error)."""
+    try:
+        import io
+        import speech_recognition as sr
+    except ImportError:
+        return None, "Voice search needs: pip install SpeechRecognition"
+    try:
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
+            audio = recognizer.record(source)
+        text = recognizer.recognize_google(audio, language="en-IN")  # "hi-IN" for Hindi
+        return text, None
+    except sr.UnknownValueError:
+        return None, "Couldn't understand the audio. Please try again."
+    except sr.RequestError as e:
+        return None, f"Speech service unavailable (check internet): {e}"
+    except Exception as e:
+        return None, f"Voice error: {e}"
 
 
 def get_chatbot_response(query: str, username: str) -> str:
@@ -2314,6 +2359,46 @@ if role == "user" and st.session_state.page == "transaction":
             append_user_history(recipient, txn)
 
         # --------------------------------------------------
+        # SMS + WHATSAPP: tell the sender AND the receiver
+        # --------------------------------------------------
+        is_external = recipient.strip().lower() not in {u.lower() for u in registered_users()}
+        alert_results = []
+
+        # 1) message to the SENDER: "you are transferring Rs. X to <receiver>"
+        sender_phone = resolve_phone(username)
+        if sender_phone:
+            sender_msg = build_alert_message(
+                sender=username,
+                receiver=recipient,
+                amount=float(txn["amount"]),
+                fraud_prob_pct=float(txn["fraud_probability"]),
+                status=txn["transaction_status"],
+                external=is_external,
+            )
+            for ok, msg in (send_sms(sender_phone, sender_msg), send_whatsapp(sender_phone, sender_msg)):
+                alert_results.append((ok, f"To sender {username}: {msg}"))
+        else:
+            alert_results.append((False, f"No mobile number saved for sender {username} - add it in 'Alert contact number'"))
+
+        # 2) message to the RECEIVER: "you have received Rs. X from <sender>"
+        #    (only when the money was actually sent)
+        if txn["transaction_status"] == "APPROVED":
+            receiver_phone = resolve_phone(recipient)
+            if receiver_phone:
+                receiver_msg = build_receiver_message(
+                    sender=username,
+                    receiver=recipient,
+                    amount=float(txn["amount"]),
+                )
+                for ok, msg in (send_sms(receiver_phone, receiver_msg), send_whatsapp(receiver_phone, receiver_msg)):
+                    alert_results.append((ok, f"To receiver {recipient}: {msg}"))
+            else:
+                alert_results.append((False, f"No mobile number for receiver {recipient} - they must save one in 'Alert contact number'"))
+
+        for _ok, _msg in alert_results:   # results go to alert_log.txt, not to the screen
+            log_event(f"{'OK  ' if _ok else 'FAIL'} {_msg}")
+
+        # --------------------------------------------------
         # LIVE STREAM RECORD
         # --------------------------------------------------
         st.session_state.GLOBAL_STREAM.insert(0, txn)
@@ -2380,29 +2465,6 @@ if role == "user" and st.session_state.page == "result":
     st.progress(min(int(analysis["probability"]), 100))
 
     st.caption(f"💳 Your balance after this transaction: ₹{get_user_balance(username):,.2f}")
-
-    risk_profile = st.session_state.get("last_risk_profile")
-    if risk_profile:
-        with st.expander("🧮 Auto-computed risk signals (not entered by you)"):
-            st.caption(
-                "These signals were derived automatically from your account history, "
-                "this merchant's track record, and simulated device/session context — "
-                "none of them were entered manually."
-            )
-            rp1, rp2, rp3 = st.columns(3)
-            with rp1:
-                st.metric("Your avg. amount", f"₹{risk_profile['user_avg_amount']:,.2f}")
-                st.metric("Your txn count", risk_profile["user_txn_count"])
-                st.metric("Account age (days)", risk_profile["user_age_days"])
-            with rp2:
-                st.metric("Merchant risk score", f"{risk_profile['merchant_risk_score']:.2f}")
-                st.metric("New merchant?", "Yes" if risk_profile["is_new_merchant"] else "No")
-                st.metric("Verified recipient?", "No" if risk_profile.get("is_unknown_recipient") else "Yes")
-            with rp3:
-                st.metric("Devices on account", risk_profile["user_device_count"])
-                st.metric("IP changed", "Yes" if risk_profile["ip_change"] else "No")
-                st.metric("Device changed", "Yes" if risk_profile["device_change"] else "No")
-                st.metric("Prior fraud count", risk_profile["previous_fraud_count"])
 
     # ------------------------------------------------------
     # API TRANSACTION DECISION
@@ -2529,6 +2591,8 @@ if role == "user" and st.session_state.page == "result":
             st.session_state.show_chat_widget = not st.session_state.show_chat_widget
             st.rerun()
 
+    user_query = None   # always defined, even when the chat box is closed
+
     if st.session_state.show_chat_widget:
         with st.container(border=True):
             st.caption(
@@ -2540,11 +2604,29 @@ if role == "user" and st.session_state.page == "result":
                     st.write(chat_msg)
 
         user_query = st.chat_input("e.g. Why hasn't the receiver gotten my money?")
-        if user_query:
-            st.session_state.chat_history.append(("user", user_query))
-            reply = get_chatbot_response(user_query, username)
-            st.session_state.chat_history.append(("assistant", reply))
-            st.rerun()
+
+        # ---------- VOICE SEARCH ----------
+        st.session_state.setdefault("voice_counter", 0)
+        st.caption("🎤 Or speak your question:")
+        voice_clip = st.audio_input(
+            "Record your question",
+            key=f"voice_input_{st.session_state.voice_counter}",
+        )
+        if voice_clip is not None:
+            with st.spinner("Listening..."):
+                spoken_text, voice_err = transcribe_audio(voice_clip.getvalue())
+            if voice_err:
+                st.warning(voice_err)
+            else:
+                st.session_state.voice_counter += 1
+                user_query = spoken_text
+        # ----------------------------------
+
+    if user_query:
+        st.session_state.chat_history.append(("user", user_query))
+        reply = get_chatbot_response(user_query, username)
+        st.session_state.chat_history.append(("assistant", reply))
+        st.rerun()
 
     st.stop()
 
@@ -2584,7 +2666,7 @@ if role == "user" and st.session_state.page == "explanation":
         if shap_result is not None:
             fig, ax = plt.subplots(figsize=(8, 4.5))
             labels = [pretty_feature_name(f) for f in shap_result.index]
-            colors = ["#D78B8B" if v > 0 else "#82B79A" for v in shap_result.values]
+            colors = ["#e74c3c" if v > 0 else "#2ecc71" for v in shap_result.values]
             bars = ax.barh(labels[::-1], shap_result.values[::-1], color=colors[::-1])
 
             for bar, val in zip(bars, shap_result.values[::-1]):
@@ -2607,16 +2689,6 @@ if role == "user" and st.session_state.page == "explanation":
             fig.tight_layout()
             st.pyplot(fig)
             st.caption("Red = pushes toward FRAUD, Green = pushes toward SAFE.")
-
-            top_factors = shap_result.head(2)
-            factor_phrases = []
-            for name, val in top_factors.items():
-                direction = "increased" if val > 0 else "decreased"
-                factor_phrases.append(f"**{pretty_feature_name(name)}** ({direction} risk, impact {val:+.3f})")
-
-            if factor_phrases:
-                summary_sentence = "This prediction was driven mainly by " + " and ".join(factor_phrases) + "."
-                st.info(f"🗣️ **In plain terms:** {summary_sentence}")
         else:
             st.warning("SHAP explanation is unavailable for this transaction.")
 
@@ -2633,9 +2705,13 @@ if role == "user" and st.session_state.page == "explanation":
         )
 
         if lime_result:
-            lime_labels = [pair[0] for pair in lime_result][::-1]
+            try:
+                _feat_row = _prepare_features(txn).iloc[0].to_dict()
+            except Exception:
+                _feat_row = {}
+            lime_labels = [simplify_lime_label(pair[0], txn, _feat_row) for pair in lime_result][::-1]
             lime_values = [pair[1] for pair in lime_result][::-1]
-            lime_colors = ["#D78B8B" if v > 0 else "#82B79A" for v in lime_values]
+            lime_colors = ["#e74c3c" if v > 0 else "#2ecc71" for v in lime_values]
 
             fig3, ax3 = plt.subplots(figsize=(8, 4.5))
             bars = ax3.barh(lime_labels, lime_values, color=lime_colors)
@@ -2732,72 +2808,30 @@ if role == "user" and st.session_state.page == "history":
         st.dataframe(uh_display.sort_values(by="timestamp", ascending=False).reset_index(drop=True), use_container_width=True, height=450)
 
         # Only payments this user SENT and that were APPROVED can be
-        # recovered — matches what actually moved money. Each eligible
-        # transaction is shown as its own row with a Recover / Track
-        # action right next to it, rather than a separate dropdown, so
-        # clicking a specific transaction is what starts (or tracks)
-        # its recovery.
+        # recovered — matches what actually moved money.
         sent = uh[uh["user_id"] == username]
         recoverable = sent[sent["transaction_status"] == "APPROVED"].copy()
+        if not recoverable.empty:
+            recoverable["timestamp"] = pd.to_datetime(recoverable["timestamp"], errors="coerce")
+            recoverable = recoverable[
+                (recoverable["timestamp"].isna()) |
+                ((datetime.now() - recoverable["timestamp"]).dt.total_seconds() <= 24 * 3600)
+            ]
 
         if not recoverable.empty:
             st.markdown("---")
             st.subheader("🔄 Recover a Payment")
-            st.caption("Sent the wrong amount, or to the wrong person? Pick the transaction below to request it back.")
+            st.caption("Sent the wrong amount, or to the wrong person? You have 24 hours to request it back.")
 
-            recovery_df = load_recovery_requests()
-            existing_by_txn = {}
-            if not recovery_df.empty:
-                mine_recovery = recovery_df[
-                    recovery_df["user_id"].astype(str).str.strip().str.lower()
-                    == username.strip().lower()
-                ]
-                for _, rrow in mine_recovery.iterrows():
-                    existing_by_txn[str(rrow["transaction_id"])] = {
-                        "status": str(rrow["status"]).strip(),
-                        "request_id": str(rrow["request_id"]),
-                    }
-
-            recoverable = recoverable.sort_values("timestamp", ascending=False)
-
-            for _, txn_row in recoverable.iterrows():
-                txn_id = str(txn_row["transaction_id"])
-                existing = existing_by_txn.get(txn_id)
-
-                with st.container(border=True):
-                    rc1, rc2, rc3, rc4 = st.columns([1.8, 1.6, 1.3, 1.6])
-                    with rc1:
-                        st.write("**Recipient**")
-                        st.write(txn_row["merchant_id"])
-                    with rc2:
-                        st.write("**Date**")
-                        st.write(txn_row["timestamp"])
-                    with rc3:
-                        st.write("**Amount**")
-                        try:
-                            st.write(f"₹{float(txn_row['amount']):,.2f}")
-                        except Exception:
-                            st.write(txn_row["amount"])
-                    with rc4:
-                        if existing:
-                            status = existing["status"]
-                            if status == "Pending":
-                                st.info("⏳ Requested")
-                            elif status == "Refunded":
-                                st.success("✅ Refunded")
-                            elif status == "Disputed":
-                                st.warning("⚠️ Disputed")
-                            else:
-                                st.write(f"Status: {status}")
-                            if st.button("📋 Track", key=f"history_track_{txn_id}", use_container_width=True):
-                                st.session_state.recovery_tracking_request_id = existing["request_id"]
-                                st.session_state.page = "my_recovery"
-                                st.rerun()
-                        else:
-                            if st.button("🔄 Recover", key=f"history_recover_{txn_id}", use_container_width=True):
-                                st.session_state.recovery_transaction_id = txn_id
-                                st.session_state.page = "recover"
-                                st.rerun()
+            txn_ids = recoverable["transaction_id"].dropna().tolist()
+            if txn_ids:
+                selected_txn = st.selectbox("Select Transaction", txn_ids, key="history_recover_select")
+                if st.button("Recover This Payment", use_container_width=True):
+                    st.session_state.recovery_transaction_id = selected_txn
+                    st.session_state.page = "recover"
+                    st.rerun()
+        else:
+            st.caption("No approved payments are currently eligible for a 24-hour recovery request.")
 
     st.stop()
 
@@ -2841,64 +2875,33 @@ if role == "user" and st.session_state.page == "scan":
 
     if scanned_data:
         parsed = parse_upi_qr(scanned_data)
+        merchant_identifier = parsed["vpa"] or parsed["raw"]
 
         st.markdown("---")
-        if not parsed["valid"]:
-            st.error(
-                "❌ This is not a valid UPI payment QR. "
-                "Please upload a QR containing a UPI payment address (VPA)."
-            )
-            if parsed["qr_type"] == "web":
-                st.caption(f"Decoded content: `{parsed['raw']}`")
+        st.success(f"✅ QR Code Scanned: **{merchant_identifier}**")
+        if parsed["name"]:
+            st.write(f"**Merchant Name:** {parsed['name']}")
+        if parsed["amount"]:
+            st.write(f"**Requested Amount:** ₹{parsed['amount']}")
+
+        trust = check_merchant_trust(merchant_identifier)
+
+        st.markdown("---")
+        st.write("### 🔍 Preliminary Safety Check")
+        st.caption("A quick heads-up based on this platform's history — the full fraud check runs on the Transaction page.")
+
+        if trust["verdict"] == "new":
+            st.warning("🟡 **New / Unverified Merchant** — no transaction history found on this platform. Proceed with caution.")
+        elif trust["verdict"] == "risky":
+            st.error(f"🔴 **High Risk Merchant** — {trust['fraud_count']} of {trust['total_transactions']} past transaction(s) with this merchant were flagged as fraud.")
         else:
-            merchant_record = resolve_qr_merchant(parsed)
-            merchant_identifier = merchant_record.get("merchant_id") or parsed.get("vpa")
+            st.success(f"✅ **Known Merchant** — {trust['total_transactions']} prior transaction(s) on record, no fraud history.")
 
-            if merchant_record.get("recognized"):
-                st.success(
-                    f"✅ QR Verified — **{merchant_record['merchant_name']}** "
-                    f"(`{merchant_record['merchant_id']}`)"
-                )
-                st.write(f"**UPI VPA:** `{merchant_record['upi_vpa']}`")
-            else:
-                st.warning(
-                    f"⚠️ Valid UPI QR, but this merchant is not in the ALVAN QR registry: "
-                    f"`{parsed.get('vpa')}`"
-                )
-
-            if parsed.get("name"):
-                st.write(f"**QR Merchant Name:** {parsed['name']}")
-            if parsed.get("amount"):
-                st.write(f"**Requested Amount:** ₹{parsed['amount']}")
-
-            trust = check_merchant_trust(merchant_identifier, merchant_record)
-
-            st.markdown("---")
-            st.write("### 🔍 Preliminary Safety Check")
-            st.caption(
-                "Merchant identity is resolved from the QR registry first; transaction risk is evaluated by the ML model on the Transaction page."
-            )
-
-            if trust["verdict"] == "risky":
-                st.error(
-                    f"🔴 **High Risk Merchant** — {trust['fraud_count']} of "
-                    f"{trust['total_transactions']} recorded transaction(s) were flagged as fraud."
-                )
-            elif merchant_record.get("recognized"):
-                st.success(
-                    f"✅ **Verified Merchant** — {merchant_record['historical_txn_count']} historical transaction(s) in the QR registry."
-                )
-            else:
-                st.warning(
-                    "🟡 **Unregistered UPI Merchant** — the QR is structurally valid, but ALVAN has no merchant mapping for it yet."
-                )
-
-            st.markdown("---")
-            if st.button("➡ Continue to Transaction with this recipient", use_container_width=True):
-                st.session_state.scanned_recipient = merchant_identifier
-                st.session_state.scanned_qr = merchant_record
-                st.session_state.page = "transaction"
-                st.rerun()
+        st.markdown("---")
+        if st.button("➡ Continue to Transaction with this recipient", use_container_width=True):
+            st.session_state.scanned_recipient = merchant_identifier
+            st.session_state.page = "transaction"
+            st.rerun()
 
     st.stop()
 
@@ -2917,9 +2920,15 @@ if role == "user" and st.session_state.page == "recover":
     uh = load_user_history(username)
     sent = uh[uh["user_id"] == username] if not uh.empty else uh
     recoverable = sent[sent["transaction_status"] == "APPROVED"].copy() if not sent.empty else sent
+    if not recoverable.empty:
+        recoverable["timestamp"] = pd.to_datetime(recoverable["timestamp"], errors="coerce")
+        recoverable = recoverable[
+            (recoverable["timestamp"].isna()) |
+            ((datetime.now() - recoverable["timestamp"]).dt.total_seconds() <= 24 * 3600)
+        ]
 
     if recoverable is None or recoverable.empty:
-        st.info("You have no approved, executed payments available for recovery yet.")
+        st.info("You have no approved, executed payments available for a 24-hour recovery request yet.")
         st.stop()
 
     txn_ids = recoverable["transaction_id"].dropna().tolist()
@@ -2942,6 +2951,9 @@ if role == "user" and st.session_state.page == "recover":
         st.write(f"**Amount:** ₹{float(transaction['amount']):,.2f}")
         st.write(f"**Transaction ID:** {transaction['transaction_id']}")
         st.write(f"**Date:** {transaction['timestamp']}")
+        tx_time = pd.to_datetime(transaction.get("timestamp"), errors="coerce")
+        deadline = (tx_time + pd.Timedelta(hours=24)) if pd.notna(tx_time) else pd.Timestamp.now() + pd.Timedelta(hours=24)
+        st.write(f"**Recovery Window:** {deadline.strftime('%Y-%m-%d %H:%M:%S')} (24h from payment)")
 
     st.markdown("---")
 
@@ -3022,8 +3034,9 @@ if role == "user" and st.session_state.page == "my_recovery":
     pending_count = int((mine["status"].astype(str).str.strip() == "Pending").sum())
     refunded_count = int((mine["status"].astype(str).str.strip() == "Refunded").sum())
     disputed_count = int((mine["status"].astype(str).str.strip() == "Disputed").sum())
+    expired_count = int((mine["status"].astype(str).str.strip() == "Expired").sum())
 
-    r1, r2, r3, r4 = st.columns(4)
+    r1, r2, r3, r4, r5 = st.columns(5)
     with r1:
         st.metric("📋 Total Requests", len(mine))
     with r2:
@@ -3032,17 +3045,20 @@ if role == "user" and st.session_state.page == "my_recovery":
         st.metric("✅ Refunded", refunded_count)
     with r4:
         st.metric("⚠️ Disputed", disputed_count)
+    with r5:
+        st.metric("⏰ Expired", expired_count)
 
     st.markdown("---")
 
     display = mine[[
         "request_id", "transaction_id", "amount", "recipient_upi",
-        "status", "timestamp"
+        "status", "timestamp", "deadline"
     ]].copy()
     display["amount"] = display["amount"].apply(lambda x: f"₹{float(x):,.2f}")
+    display["time_left"] = display["deadline"].apply(format_time_remaining)
     display.columns = [
         "Recovery Request ID", "Transaction ID", "Amount",
-        "Recipient", "Status", "Submitted On"
+        "Recipient", "Status", "Submitted On", "Deadline", "Time Left"
     ]
     st.dataframe(display, use_container_width=True, hide_index=True)
 
@@ -3074,9 +3090,11 @@ if role == "user" and st.session_state.page == "my_recovery":
                 "Your recovery request has been submitted successfully. The recipient has to "
                 "accept or reject/dispute the request before the refund can be completed."
             )
+            deadline_value = selected.get("deadline", "")
+            time_left = format_time_remaining(deadline_value)
             timing_text = (
-                "Demo timing: there is no fixed number of hours/days in this prototype — the request "
-                "stays Pending until the recipient takes action."
+                f"24-hour recovery window is active. Deadline: **{deadline_value}**. "
+                f"Time remaining: **{time_left}**."
             )
         else:
             status_title = "⏳ Pending Manual Review"
@@ -3084,11 +3102,15 @@ if role == "user" and st.session_state.page == "my_recovery":
                 "The recipient is not a registered ALVAN account, so there is no recipient-side "
                 "accept/reject action in this demo. The request remains an audit/manual-review case."
             )
-            timing_text = (
-                "Demo timing: no automatic refund is scheduled for an external recipient; an admin/manual "
-                "review is required."
-            )
+            timing_text = "The platform still tracks this as a 24-hour recovery request until an admin resolves it."
         border = "#D97706"
+    elif status == "Expired":
+        status_title = "⏰ Recovery Window Expired"
+        status_text = (
+            "The 24-hour recovery window has elapsed, so this request can no longer be refunded through the normal flow."
+        )
+        timing_text = "No further refund will be processed automatically after the deadline passes."
+        border = "#6B7280"
     elif status == "Refunded":
         status_title = "✅ Refund Completed"
         status_text = (
@@ -3132,10 +3154,12 @@ if role == "user" and st.session_state.page == "my_recovery":
             st.write(f"**Recovery Request ID:** {selected['request_id']}")
             st.write(f"**Transaction ID:** {selected['transaction_id']}")
             st.write(f"**Recipient:** {recipient}")
+            st.write(f"**Deadline:** {selected.get('deadline', 'Not set')}")
         with d2:
             st.write(f"**Amount:** ₹{amount:,.2f}")
             st.write(f"**Reason:** {selected['reason']}")
             st.write(f"**Submitted On:** {selected['timestamp']}")
+            st.write(f"**Time Left:** {format_time_remaining(selected.get('deadline'))}")
 
     st.markdown("---")
     st.info(
@@ -3176,10 +3200,10 @@ if role == "user" and st.session_state.page == "recovery_requests":
 
     st.markdown("---")
 
-    pending = received[received["status"] == "Pending"].copy()
+    pending = received[received["status"].astype(str).str.strip().isin(["Pending", "Pending Receiver Response"])].copy()
 
     if pending.empty:
-        st.info("No pending recovery requests.")
+        st.info("No pending recovery requests. Expired requests remain visible in the admin audit log.")
         st.stop()
 
     request_ids = pending["request_id"].tolist()
@@ -3192,6 +3216,7 @@ if role == "user" and st.session_state.page == "recovery_requests":
         st.write(f"**Amount:** ₹{float(selected_request['amount']):,.2f}")
         st.write(f"**Reason:** {selected_request['reason']}")
         st.write(f"**Requested On:** {selected_request['timestamp']}")
+        st.write(f"**Recovery Deadline:** {selected_request.get('deadline', 'Not set')} ({format_time_remaining(selected_request.get('deadline'))})")
 
     st.markdown("---")
 
@@ -3577,7 +3602,7 @@ elif st.session_state.admin_page == "performance":
             st.write("**Precision-Recall vs Threshold**")
             precision, recall, thresholds = precision_recall_curve(y_val, y_proba)
             fig2, ax2 = plt.subplots()
-            ax2.plot(thresholds, precision[:-1], label="Precision", color="#7EA6D8")
+            ax2.plot(thresholds, precision[:-1], label="Precision", color="#4FC3F7")
             ax2.plot(thresholds, recall[:-1], label="Recall", color="#FFB74D")
             ax2.axvline(x=0.5, color="#E57373", linestyle="--", label="Current threshold (0.5)")
             ax2.set_xlabel("Threshold")
@@ -3604,7 +3629,8 @@ elif st.session_state.admin_page == "performance":
             st.image(fi_path, caption="Top 20 Feature Importances (LightGBM, gain)", use_container_width=True)
 
     except FileNotFoundError:
-        st.warning("Run train.py first to generate model performance data.")
+        st.info("Model performance files are missing. Generate the dataset and train the model first:")
+        st.code("python generate_dataset.py\npython train.py")
 
 # ----------------------------------------------------------
 # ADMIN PAGE: MODEL COMPARISON
@@ -3726,9 +3752,9 @@ elif st.session_state.admin_page == "ring":
             fig, ax = plt.subplots(figsize=(10, 7))
             pos = nx.spring_layout(G, seed=42, k=0.6)
 
-            node_colors = ["#D78B8B" if n in suspicious_members else "#7EA6D8" for n in G.nodes()]
+            node_colors = ["#e74c3c" if n in suspicious_members else "#4FC3F7" for n in G.nodes()]
             edge_colors = [
-                "#D78B8B" if G[u][v]["fraud_count"] > 0 else "#3a5a80"
+                "#e74c3c" if G[u][v]["fraud_count"] > 0 else "#3a5a80"
                 for u, v in G.edges()
             ]
             edge_widths = [1 + G[u][v]["weight"] * 0.5 for u, v in G.edges()]
@@ -3755,7 +3781,7 @@ elif st.session_state.admin_page == "ring":
             st.info("No multi-account clusters detected yet.")
         else:
             for c in clusters[:20]:
-                border_color = "#D78B8B" if c["suspicious"] else "#3a5a80"
+                border_color = "#e74c3c" if c["suspicious"] else "#3a5a80"
                 with st.container(border=True):
                     st.markdown(
                         f"""
