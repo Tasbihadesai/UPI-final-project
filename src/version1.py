@@ -146,7 +146,7 @@ def generate_random_transaction():
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "user_id": f"user_{np.random.randint(1,500)}",
         "merchant_id": f"merchant_{np.random.randint(1,300)}",
-        "txn_type": np.random.choice(["send","receive","withdraw","upi_collect"]),
+        "txn_type": np.random.choice(["send","receive"]),
         "upi_app": np.random.choice(["GPay","PhonePe","Paytm","AmazonPay","BHIM"]),
         "amount": round(np.random.uniform(50,30000),2),
         "user_avg_amount": round(np.random.uniform(50,15000),2),

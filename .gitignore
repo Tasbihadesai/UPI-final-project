@@ -4,3 +4,5 @@ __pycache__/
 .env
 .streamlit/secrets.toml
 data/QR code/
+# Do not upload this environment example
+/models/env (1).example
