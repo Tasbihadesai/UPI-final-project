@@ -25,7 +25,16 @@ from datetime import datetime, timedelta
 from explain import explain_transaction
 import shap
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve
+from sklearn.metrics import (
+    confusion_matrix, 
+    ConfusionMatrixDisplay, 
+    precision_recall_curve,
+    accuracy_score, 
+    precision_score, 
+    recall_score, 
+    f1_score, 
+    roc_auc_score
+)
 import requests
 import networkx as nx
 from notifier import build_alert_message, build_receiver_message, send_sms, send_whatsapp, log_event
@@ -71,8 +80,7 @@ MODEL_PATH = os.path.join(BASE_DIR, "models", "lightgbm_model.pkl")
 STREAM_INTERVAL = 5
 MAX_STREAM_LEN = 500
 
-# Logo / hero image — resolved relative to this script's own folder so it
-# works no matter what directory Streamlit is launched from.
+# Logo / hero image
 BG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alvan.png")
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -115,12 +123,12 @@ if "ui_mode" not in st.session_state:
 # History csv columns
 # ------------------------------
 HISTORY_COLUMNS = [
-    "timestamp","transaction_id","user_id","merchant_id","txn_type","upi_app","amount",
-    "user_avg_amount","user_txn_count","user_age_days","user_device_count",
-    "merchant_risk_score","hour","day_of_week","ip_change","device_change",
-    "txn_velocity","previous_fraud_count","is_new_merchant","geo_distance_km",
-    "fraud_probability","fraud_flag",
-    "risk_level","transaction_status","payment_status","receiver_credited",
+    "timestamp", "transaction_id", "user_id", "merchant_id", "txn_type", "upi_app", "amount",
+    "user_avg_amount", "user_txn_count", "user_age_days", "user_device_count",
+    "merchant_risk_score", "hour", "day_of_week", "ip_change", "device_change",
+    "txn_velocity", "previous_fraud_count", "is_new_merchant", "geo_distance_km",
+    "fraud_probability", "fraud_flag",
+    "risk_level", "transaction_status", "payment_status", "receiver_credited",
     "api_message"
 ]
 
@@ -144,11 +152,6 @@ def ensure_users_db():
             csv.DictWriter(f, fieldnames=USER_FIELDS).writeheader()
 
 def read_users():
-    """
-    Reads all registered accounts and safely upgrades older CSV formats.
-    Existing Admin/User roles are preserved; the application never guesses
-    an Admin account from its username.
-    """
     ensure_users_db()
     try:
         with open(USERS_DB, "r", newline="", encoding="utf-8-sig") as f:
@@ -166,7 +169,6 @@ def read_users():
             r["email"] = ""
         if r.get("phone") is None:
             r["phone"] = ""
-        # Older local CSV files may have used a different password column.
         if not r.get("password_hash") and r.get("password"):
             r["password_hash"] = r.get("password")
             upgraded = True
@@ -182,7 +184,6 @@ def read_users():
     return rows
 
 def _write_all_users(rows: list):
-    """Rewrites the entire users.csv from a list of row dicts, preserving schema."""
     with open(USERS_DB, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=USER_FIELDS)
         writer.writeheader()
@@ -200,7 +201,7 @@ def register_user(username: str, password: str, email: str = "", phone: str = ""
     ensure_users_db()
     if user_exists(username):
         return False
-    read_users()  # makes sure the CSV header has the email/phone columns
+    read_users()
     with open(USERS_DB, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=USER_FIELDS)
         writer.writerow({
@@ -216,13 +217,6 @@ def register_user(username: str, password: str, email: str = "", phone: str = ""
     return True
 
 def validate_user(username: str, password: str) -> bool:
-    """
-    Validates the credentials stored in users.csv.
-
-    The current project format is SHA-256. A legacy plaintext password is
-    also accepted once and immediately migrated to SHA-256 so older local
-    users.csv files continue to work without breaking the login flow.
-    """
     uname = normalize_username(username).lower()
     provided = str(password or "")
     provided_hash = hash_password(provided)
@@ -239,11 +233,9 @@ def validate_user(username: str, password: str) -> bool:
         if stored_name != uname:
             continue
 
-        # Current SHA-256 format (plain 64-char hex).
         if hmac.compare_digest(stored_value.lower(), provided_hash.lower()):
             return True
 
-        # Some older local copies may have stored a labelled SHA-256 value.
         for prefix in ("sha256:", "sha256$", "sha256-"):
             if stored_value.lower().startswith(prefix):
                 candidate = stored_value[len(prefix):].strip()
@@ -252,8 +244,6 @@ def validate_user(username: str, password: str) -> bool:
                     changed = True
                     break
         else:
-            # Backward compatibility for any old local users.csv row that may
-            # contain the password itself rather than its hash.
             if hmac.compare_digest(stored_value, provided):
                 r["password_hash"] = provided_hash
                 changed = True
@@ -270,7 +260,6 @@ def validate_user(username: str, password: str) -> bool:
     return False
 
 def reset_user_password(username: str, new_password: str) -> bool:
-    """Reset a password and verify that the same users.csv persists it."""
     target = normalize_username(username).lower()
     new_password = str(new_password or "")
     if not target or not new_password:
@@ -286,8 +275,6 @@ def reset_user_password(username: str, new_password: str) -> bool:
             found = True
             break
 
-    # If the demo admin row is missing, repair it when the requested
-    # username is exactly "admin". Other missing usernames still fail.
     if not found and target == DEFAULT_ADMIN_USERNAME:
         users.append({
             "username": DEFAULT_ADMIN_USERNAME,
@@ -310,7 +297,6 @@ def reset_user_password(username: str, new_password: str) -> bool:
     )
 
 def ensure_admin_account():
-    """Create the demo admin only if it is missing; never overwrite it."""
     users = read_users()
     target = DEFAULT_ADMIN_USERNAME.lower()
     if any(normalize_username(u.get("username")).lower() == target for u in users):
@@ -324,8 +310,6 @@ def ensure_admin_account():
     })
     _write_all_users(users)
 
-# Ensure the demo Admin account exists once. Existing admin passwords are
-# never overwritten automatically.
 ensure_admin_account()
 
 def get_user_role(username: str) -> str:
@@ -350,7 +334,6 @@ def get_user_balance(username: str) -> float:
     return 0.0
 
 def get_user_contact(username: str):
-    """Returns (email, phone) saved for this user, or ('', '')."""
     target = normalize_username(username).lower()
     for r in read_users():
         if normalize_username(r.get("username")).lower() == target:
@@ -358,7 +341,6 @@ def get_user_contact(username: str):
     return "", ""
 
 def resolve_phone(identifier: str) -> str:
-    """Phone for an ALVAN user (from users.csv) or, for an outside recipient, the number typed in."""
     ident = str(identifier or "").strip()
     _, phone = get_user_contact(ident)
     if phone:
@@ -376,14 +358,6 @@ def update_user_contact(username: str, email: str, phone: str) -> bool:
     return False
 
 def transfer_balance(sender: str, recipient: str, amount: float) -> bool:
-    """
-    Moves `amount` from sender to recipient. If recipient isn't a
-    registered account (e.g. a scanned external UPI ID), the amount is
-    simply deducted from the sender — matching real UPI behavior where
-    money leaves your account the moment a payment is approved, whether
-    or not the payee is on this platform.
-    Returns False if the sender doesn't have enough balance.
-    """
     users = read_users()
     sender_row = next((u for u in users if u["username"] == sender), None)
     if sender_row is None:
@@ -404,11 +378,6 @@ def transfer_balance(sender: str, recipient: str, amount: float) -> bool:
     return True
 
 def reverse_transfer(original_sender: str, current_holder: str, amount: float) -> bool:
-    """
-    Used by the recovery flow: pulls `amount` back from current_holder and
-    returns it to original_sender. Fails safely (returns False) if the
-    holder doesn't have enough balance left to refund.
-    """
     users = read_users()
     holder_row = next((u for u in users if u["username"] == current_holder), None)
     if holder_row is None:
@@ -460,14 +429,6 @@ def append_user_history(username: str, txn: dict):
     df.to_csv(path, index=False)
 
 def update_transaction_status_everywhere(transaction_id: str, new_status: str):
-    """
-    A transaction is stored redundantly in both the sender's and the
-    recipient's own history CSV (so each person's history page is
-    self-contained). When a recovery request changes its outcome (e.g.
-    -> 'Refunded' or 'Disputed'), both copies need to agree, so this
-    walks every registered user's history file and updates any row that
-    matches the transaction_id.
-    """
     for u in registered_users():
         path = create_user_history_file(u)
         try:
@@ -485,20 +446,18 @@ def update_transaction_status_everywhere(transaction_id: str, new_status: str):
 # Fraud alert audit log
 # ------------------------------
 FRAUD_ALERTS_PATH = os.path.join(DATA_DIR, "fraud_alerts.csv")
-ALERT_COLUMNS = ["alert_id"] + HISTORY_COLUMNS + ["reviewed"]
+ALERT_COLUMNS = ["alert_id"] + HISTORY_COLUMNS
 
 def ensure_fraud_alerts_db():
     if not os.path.exists(FRAUD_ALERTS_PATH):
         pd.DataFrame(columns=ALERT_COLUMNS).to_csv(FRAUD_ALERTS_PATH, index=False)
 
 def append_fraud_alert(txn: dict):
-    """Logs a transaction to the fraud alert audit trail — only called when fraud_flag is FRAUD."""
     if txn.get("fraud_flag") != "⚠️ FRAUD":
         return
     ensure_fraud_alerts_db()
     alert_row = dict(txn)
     alert_row["alert_id"] = uuid.uuid4().hex[:10]
-    alert_row["reviewed"] = "No"
     try:
         df = pd.read_csv(FRAUD_ALERTS_PATH)
     except Exception:
@@ -518,12 +477,6 @@ def load_fraud_alerts() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=ALERT_COLUMNS)
 
-def mark_alert_reviewed(alert_id: str):
-    df = load_fraud_alerts()
-    if "alert_id" in df.columns:
-        df.loc[df["alert_id"] == alert_id, "reviewed"] = "Yes"
-        df.to_csv(FRAUD_ALERTS_PATH, index=False)
-
 # ------------------------------
 # Payment recovery requests
 # ------------------------------
@@ -533,10 +486,8 @@ RECOVERY_COLUMNS = [
     "recipient_upi", "reason", "status", "timestamp", "deadline", "resolved_at"
 ]
 
-
 def get_recovery_deadline_from_now(hours: int = 24) -> str:
     return (datetime.now() + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
-
 
 def format_time_remaining(deadline_value) -> str:
     try:
@@ -552,7 +503,6 @@ def format_time_remaining(deadline_value) -> str:
         return f"{hours}h {minutes}m left"
     except Exception:
         return "expired"
-
 
 def expire_recovery_requests() -> pd.DataFrame:
     ensure_recovery_db()
@@ -589,11 +539,9 @@ def expire_recovery_requests() -> pd.DataFrame:
         df.to_csv(RECOVERY_FILE, index=False)
     return df
 
-
 def ensure_recovery_db():
     if not os.path.exists(RECOVERY_FILE):
         pd.DataFrame(columns=RECOVERY_COLUMNS).to_csv(RECOVERY_FILE, index=False)
-
 
 def load_recovery_requests() -> pd.DataFrame:
     ensure_recovery_db()
@@ -606,19 +554,11 @@ def load_recovery_requests() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=RECOVERY_COLUMNS)
 
-
 def save_recovery_requests(df: pd.DataFrame):
     df = df.reindex(columns=RECOVERY_COLUMNS)
     df.to_csv(RECOVERY_FILE, index=False)
 
-
 def submit_recovery_request(username: str, transaction_row) -> dict:
-    """
-    Files a recovery request for a completed transaction. Returns
-    {'ok': True, 'request_id': ...} on success, or
-    {'ok': False, 'error': '...'} if one already exists for this
-    transaction.
-    """
     recovery = load_recovery_requests()
 
     duplicate = recovery[
@@ -701,11 +641,6 @@ _MONEY_FEATURES = {"amount", "user_avg_amount"}
 _DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 def simplify_lime_label(rule: str, txn: dict, feature_values: dict) -> str:
-    """
-    Turns a raw LIME rule such as 'merchant_risk_score <= 0.34' or
-    '0.00 < txn_type <= 1.00' into plain English such as
-    'Merchant Risk Score: 0.10 (low)' or 'Transaction Type: Send'.
-    """
     import re
     tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str(rule))
     if not tokens:
@@ -713,7 +648,6 @@ def simplify_lime_label(rule: str, txn: dict, feature_values: dict) -> str:
     feat = tokens[0]
     friendly = pretty_feature_name(feat)
 
-    # low / medium / high, taken from the direction of the LIME rule
     if re.match(r"^\s*-?[\d.]+\s*<", str(rule)):
         level = "medium"
     elif ">" in str(rule):
@@ -721,7 +655,6 @@ def simplify_lime_label(rule: str, txn: dict, feature_values: dict) -> str:
     else:
         level = "low"
 
-    # categories the user actually chose
     if feat in ("txn_type", "upi_app"):
         raw = txn.get(feat)
         return f"{friendly}: {str(raw).title() if feat == 'txn_type' else raw}" if raw else friendly
@@ -782,12 +715,6 @@ def predict_prob(txn: dict) -> float:
         return 0.0
 
 def normalize_probability(raw_probability) -> float:
-    """Return a fraud probability as a decimal in the range 0..1.
-
-    The API may return either 0..1 or 0..100. The previous UI always
-    multiplied by 100, which produced incorrect values when the API already
-    returned a percentage.
-    """
     try:
         p = float(raw_probability)
     except (TypeError, ValueError):
@@ -797,7 +724,6 @@ def normalize_probability(raw_probability) -> float:
     if p > 1.0:
         p /= 100.0
     return float(np.clip(p, 0.0, 1.0))
-
 
 def normalized_api_decision(api_result: dict) -> dict:
     raw = api_result.get(
@@ -827,16 +753,7 @@ def normalized_api_decision(api_result: dict) -> dict:
         "risk_level": risk_level,
     }
 
-
 def predict_transaction_api(txn: dict) -> dict:
-    """
-    Generate a fraud decision using the app's built-in model pipeline.
-
-    The project does not ship a standalone predict.py file, so the app should
-    never depend on a missing local Flask service on port 5000. If the model
-    cannot be loaded, the function falls back to a conservative heuristic to
-    avoid hard failure during transaction approval flows.
-    """
     try:
         probability = float(predict_prob(dict(txn)))
         probability = float(np.clip(probability, 0.0, 1.0))
@@ -891,14 +808,8 @@ def predict_transaction_api(txn: dict) -> dict:
             "inference_source": "heuristic_fallback",
         }
 
-
 @st.cache_resource
 def load_lime_explainer():
-    """
-    Builds a LIME tabular explainer once, using a saved sample of the
-    real training data as background so LIME understands normal value
-    ranges for each feature (unlike SHAP's TreeExplainer, LIME needs this).
-    """
     import lime
     import lime.lime_tabular
 
@@ -923,11 +834,6 @@ def load_lime_explainer():
         return None
 
 def get_lime_explanation(txn: dict, top_n: int = 5):
-    """
-    Returns a list of (feature_description, weight) tuples from LIME for
-    this single transaction, run against the same LightGBM model used
-    for the prediction and for SHAP.
-    """
     if MODEL is None:
         return None
 
@@ -956,20 +862,12 @@ def get_lime_explanation(txn: dict, top_n: int = 5):
         return None
 
 def get_recommendation(txn: dict, analysis: dict, shap_result=None, lime_result=None) -> dict:
-    """
-    Turns the raw fraud probability + risk signals into a single,
-    actionable recommendation for the admin/reviewer: whether to
-    block the user, hold the transaction for manual review, or
-    let it proceed — plus the reasoning behind that call.
-    """
     prob = analysis["probability"]
     prev_fraud = int(txn.get("previous_fraud_count", 0) or 0)
     ip_change = int(txn.get("ip_change", 0) or 0)
     device_change = int(txn.get("device_change", 0) or 0)
     is_blocked = txn.get("transaction_status") == "BLOCKED"
 
-    # Check whether SHAP and LIME agree on the single strongest signal —
-    # used as a confidence booster/reducer on the recommendation.
     top_shap_feature = None
     if shap_result is not None and len(shap_result) > 0:
         top_shap_feature = shap_result.index[0]
@@ -984,11 +882,6 @@ def get_recommendation(txn: dict, analysis: dict, shap_result=None, lime_result=
         and pretty_feature_name(top_shap_feature).lower() in top_lime_feature.lower()
     )
 
-    # IMPORTANT: the recommendation must never contradict the transaction
-    # decision the Flask API already made. If the payment was blocked and
-    # not executed, the recommendation can only ever be some flavor of
-    # "block/escalate" — never "hold for review" or "proceed", since those
-    # would misrepresent what actually happened to the money.
     if is_blocked:
         action = "🚫 Block User"
         action_color = "#e74c3c"
@@ -1039,11 +932,9 @@ def get_shap_explanation(txn: dict, top_n: int = 5):
         return None
 
 # ------------------------------
-# QR scan helpers (used by the Scan-to-Pay feature)
+# QR scan helpers
 # ------------------------------
 def parse_upi_qr(data: str) -> dict:
-    """Parses a decoded QR string. Handles real UPI URIs (upi://pay?pa=...&pn=...)
-    and falls back to treating the raw string as the identifier for any other QR content."""
     from urllib.parse import urlparse, parse_qs
     if data and data.startswith("upi://"):
         parsed = urlparse(data)
@@ -1057,8 +948,6 @@ def parse_upi_qr(data: str) -> dict:
     return {"raw": data, "vpa": data, "name": None, "amount": None}
 
 def decode_qr_from_image(uploaded_file) -> str:
-    """Decodes a QR code from an uploaded image file (Streamlit UploadedFile). Returns the
-    decoded string, or None if no QR code was found or the libraries aren't available."""
     try:
         import cv2
         import numpy as _np
@@ -1082,8 +971,6 @@ def decode_qr_from_image(uploaded_file) -> str:
         return None
 
 def scan_qr_live() -> str:
-    """Opens a native webcam window (same approach as test_camera.py) and returns the
-    first decoded QR code string, or None if cancelled (ESC) or unavailable."""
     try:
         import cv2
         from pyzbar.pyzbar import decode as qr_decode
@@ -1109,7 +996,7 @@ def scan_qr_live() -> str:
                 break
 
             cv2.imshow("Scan QR Code - press ESC to cancel", frame)
-            if cv2.waitKey(1) & 0xFF == 27:  # ESC key
+            if cv2.waitKey(1) & 0xFF == 27:
                 break
     except Exception as e:
         st.error(f"Camera scan error: {e}")
@@ -1120,8 +1007,6 @@ def scan_qr_live() -> str:
     return result
 
 def check_merchant_trust(merchant_identifier: str) -> dict:
-    """Looks up a scanned merchant identifier across all known transaction history and
-    fraud alerts to determine whether this merchant is new, safe, or risky."""
     total_transactions = 0
     fraud_count = 0
     probs = []
@@ -1164,19 +1049,10 @@ def check_merchant_trust(merchant_identifier: str) -> dict:
 # Random live tx generator
 # ------------------------------
 def random_stream_txn() -> dict:
-    """
-    Generates a simulated transaction for the admin Live Stream demo —
-    now grounded in the SAME risk-computation engine real transactions use
-    (compute_user_risk_profile), picking an actual registered account as
-    the sender so the behavioral/merchant signals reflect real stored
-    history instead of being arbitrary random numbers disconnected from
-    the rest of the system.
-    """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     users_pool = registered_users()
 
     if not users_pool:
-        # Fallback for a brand-new install with no registered accounts yet.
         return {
             "timestamp": timestamp,
             "user_id": f"user_{np.random.randint(1, 500)}",
@@ -1202,9 +1078,6 @@ def random_stream_txn() -> dict:
     sender = str(np.random.choice(users_pool))
     other_users = [u for u in users_pool if u != sender]
 
-    # ~20% of simulated transactions go to a genuinely unverified/external
-    # recipient — same risk framing as the real "Send to someone not in
-    # ALVAN" option, so the live feed shows that risk pattern too.
     if other_users and np.random.random() > 0.20:
         recipient = str(np.random.choice(other_users))
     else:
@@ -1278,7 +1151,6 @@ section[data-testid="stSidebar"] span {
     color: #172033 !important;
 }
 
-/* Professional white buttons with black text everywhere. */
 div.stButton > button,
 div[data-testid="stFormSubmitButton"] button,
 button[data-testid="baseButton-primary"],
@@ -1311,16 +1183,6 @@ button[kind="secondary"]:hover {
     box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
     transform: translateY(-1px);
 }
-div.stButton > button p,
-div.stButton > button span,
-div[data-testid="stFormSubmitButton"] button p,
-div[data-testid="stFormSubmitButton"] button span,
-button[data-testid="baseButton-primary"] p,
-button[data-testid="baseButton-primary"] span,
-button[data-testid="baseButton-secondary"] p,
-button[data-testid="baseButton-secondary"] span {
-    color: #111827 !important;
-}
 
 div[data-baseweb="select"] > div {
     background: #FFFFFF !important;
@@ -1333,7 +1195,6 @@ div[data-testid="stDataFrame"] {
     border-radius: 10px;
 }
 
-/* White decision/recommendation cards remain readable on the light page. */
 .alvan-status-card {
     background:#FFFFFF;
     border:1px solid #E2E8F0;
@@ -1372,11 +1233,10 @@ div[data-testid="stDataFrame"] {
 """, unsafe_allow_html=True)
 
 # ----------------------------------------------------------
-# PAGE 1a: LANDING PAGE  (marketing-style front page)
+# PAGE 1a: LANDING PAGE
 # ----------------------------------------------------------
 if not st.session_state.authenticated and st.session_state.entry_page == "landing":
 
-    # ---- Top Nav Bar ----
     nav_l, nav_m, nav_r1, nav_r2 = st.columns([2.2, 2, 0.9, 0.9])
     with nav_l:
         st.markdown("<h2 style='color:#172033; margin-top:4px;'>🛡️ ALVAN</h2>", unsafe_allow_html=True)
@@ -1392,7 +1252,6 @@ if not st.session_state.authenticated and st.session_state.entry_page == "landin
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ---- Hero Section ----
     hero_left, hero_right = st.columns([1, 1.35])
 
     with hero_left:
@@ -1441,7 +1300,6 @@ if not st.session_state.authenticated and st.session_state.entry_page == "landin
     st.markdown("<div style='margin-top:15px;'></div>", unsafe_allow_html=True)
     st.markdown("---")
 
-    # ---- Feature Highlights ----
     st.markdown(
         "<h3 style='text-align:center; color:#172033; margin-top:10px; margin-bottom:25px;'>Why ALVAN?</h3>",
         unsafe_allow_html=True,
@@ -1485,7 +1343,6 @@ if not st.session_state.authenticated and st.session_state.entry_page == "landin
                 unsafe_allow_html=True,
             )
 
-    # ---- How It Works ----
     st.markdown("<div style='margin-top:40px;'></div>", unsafe_allow_html=True)
     st.markdown("---")
     st.markdown(
@@ -1524,7 +1381,7 @@ if not st.session_state.authenticated and st.session_state.entry_page == "landin
     st.stop()
 
 # ----------------------------------------------------------
-# PAGE 1b: LOGIN / REGISTER  (separate page from the landing page)
+# PAGE 1b: LOGIN / REGISTER
 # ----------------------------------------------------------
 if not st.session_state.authenticated and st.session_state.entry_page == "login":
 
@@ -1564,7 +1421,6 @@ if not st.session_state.authenticated and st.session_state.entry_page == "login"
             action = st.session_state.auth_action
 
             if action == "login":
-
                 avatar_col, form_col = st.columns([1, 1.6])
 
                 with avatar_col:
@@ -1583,7 +1439,6 @@ if not st.session_state.authenticated and st.session_state.entry_page == "login"
                     )
 
                 with form_col:
-
                     tab1, tab2 = st.columns(2)
                     with tab1:
                         if st.button(
@@ -1615,7 +1470,6 @@ if not st.session_state.authenticated and st.session_state.entry_page == "login"
                         elif not pwd:
                             st.error("Please enter your password.")
                         elif validate_user(uname_clean, pwd):
-                            # Use the canonical username stored in users.csv.
                             canonical_username = next(
                                 (u["username"] for u in read_users()
                                  if normalize_username(u.get("username")).lower() == uname_clean.lower()),
@@ -1727,19 +1581,11 @@ if not st.session_state.authenticated and st.session_state.entry_page == "login"
 username = st.session_state.username
 role = get_user_role(username)
 
-# ----------------------------------------------------------
-# Desktop / Mobile presentation switch
-# ----------------------------------------------------------
-# This changes presentation only. All existing pages, state, data,
-# fraud detection, recovery, admin and authentication logic remain intact.
+# Presentation Mode Switch
 if role in ("user", "admin"):
     st.markdown("""
     <style>
-    /* Default: desktop presentation */
     .alvan-mode-marker { display:none; }
-
-    /* Mobile presentation is activated by the session-state marker.
-       :has() is supported by current Chrome/Edge/Firefox/Safari. */
     body:has(.alvan-mobile-mode-marker) [data-testid="stAppViewContainer"] {
         background: #f7faff;
     }
@@ -1776,24 +1622,6 @@ if role in ("user", "admin"):
         border-radius: 12px;
         font-weight: 600;
     }
-    .alvan-mobile-nav {
-        position: fixed;
-        left: 50%;
-        transform: translateX(-50%);
-        bottom: 10px;
-        width: min(420px, calc(100vw - 20px));
-        z-index: 999999;
-        background: rgba(255,255,255,.97);
-        border: 1px solid #dbe4ef;
-        border-radius: 18px;
-        padding: 7px;
-        box-shadow: 0 8px 30px rgba(31, 55, 85, .12);
-    }
-    .alvan-mobile-nav button {
-        border-radius: 12px !important;
-        min-height: 42px !important;
-        font-size: 12px !important;
-    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1816,7 +1644,6 @@ if role in ("user", "admin"):
     else:
         st.markdown('<div class="alvan-desktop-mode-marker"></div>', unsafe_allow_html=True)
 
-
 if os.path.exists(BG_PATH):
     st.sidebar.image(BG_PATH, width=120)
 st.sidebar.title("ALVAN")
@@ -1835,7 +1662,7 @@ if st.sidebar.button("🚪 Logout", use_container_width=True):
     st.rerun()
 
 # ----------------------------------------------------------
-# PAGE 2: DASHBOARD  (role == "user")
+# PAGE 2: DASHBOARD (role == "user")
 # ----------------------------------------------------------
 if role == "user" and st.session_state.page == "dashboard":
 
@@ -1946,9 +1773,7 @@ if role == "user" and st.session_state.page == "dashboard":
 
     st.stop()
 
-
 def transcribe_audio(audio_bytes: bytes):
-    """Converts recorded audio (WAV) to text. Returns (text, error)."""
     try:
         import io
         import speech_recognition as sr
@@ -1958,7 +1783,7 @@ def transcribe_audio(audio_bytes: bytes):
         recognizer = sr.Recognizer()
         with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
             audio = recognizer.record(source)
-        text = recognizer.recognize_google(audio, language="en-IN")  # "hi-IN" for Hindi
+        text = recognizer.recognize_google(audio, language="en-IN")
         return text, None
     except sr.UnknownValueError:
         return None, "Couldn't understand the audio. Please try again."
@@ -1967,15 +1792,7 @@ def transcribe_audio(audio_bytes: bytes):
     except Exception as e:
         return None, f"Voice error: {e}"
 
-
 def get_chatbot_response(query: str, username: str) -> str:
-    """
-    Rule-based assistant for the dashboard. Answers common questions about
-    delays, blocks, and "money deducted but not received" — and when the
-    question is personal ("my transaction", "not received", etc.), it looks
-    at the user's own most recent transaction to give a specific answer
-    instead of a generic one.
-    """
     q = query.lower().strip()
 
     personal_keywords = [
@@ -2063,15 +1880,7 @@ def get_chatbot_response(query: str, username: str) -> str:
         "*'why hasn't the receiver gotten the money?'*, or *'how does fraud detection work?'*"
     )
 
-
 def compute_merchant_risk_score(merchant_id: str, is_registered: bool = True) -> float:
-    """
-    Looks at every past transaction across ALL users where merchant_id was
-    the recipient, and returns the observed fraud rate for that merchant —
-    with a moderate default for a merchant with no track record yet, and a
-    higher default for a recipient that isn't even a registered/verified
-    UPI ID on this platform (a genuinely unknown payee).
-    """
     total = 0
     fraud = 0
     for u in registered_users():
@@ -2089,24 +1898,12 @@ def compute_merchant_risk_score(merchant_id: str, is_registered: bool = True) ->
             pass
 
     if total == 0:
-        # No history is not evidence of fraud. Let the model use its explicit
-        # new/unknown-recipient features instead of forcing a high merchant risk.
         return 0.10
 
     rate = fraud / total
-    return round(min(1.0, rate + 0.05), 2)  # small smoothing so a single fraud hit doesn't overreact
-
+    return round(min(1.0, rate + 0.05), 2)
 
 def compute_user_risk_profile(username: str, recipient: str, amount: float) -> dict:
-    """Build behavioral context from stored history without prediction feedback.
-
-    Important: transactions that were only *predicted* as fraud/blocked are
-    not treated as confirmed fraud incidents for the next prediction. The
-    current prototype has no separate human-confirmed-fraud field, so
-    `previous_fraud_count` remains 0 until such confirmation exists. This
-    prevents the model from learning from its own previous prediction at
-    runtime.
-    """
     hist = load_user_history(username)
     sent = hist[hist["user_id"].astype(str).str.strip() == str(username).strip()] if not hist.empty else hist
 
@@ -2135,10 +1932,7 @@ def compute_user_risk_profile(username: str, recipient: str, amount: float) -> d
             sent["merchant_id"].dropna().astype(str).str.strip().tolist()
         )
 
-    # A model prediction such as "BLOCKED" is an alert, not proof of fraud.
-    # Do not feed the model's own previous prediction back into the next one.
     previous_fraud_count = 0
-
     user_age_days = 180
     normalized_target = normalize_username(username).lower()
     for r in read_users():
@@ -2154,8 +1948,6 @@ def compute_user_risk_profile(username: str, recipient: str, amount: float) -> d
                 user_age_days = 180
             break
 
-    # This prototype has no real device/IP/GPS telemetry. Use neutral values
-    # instead of random values so identical transactions are deterministic.
     user_device_count = 1
     known_users = {
         normalize_username(u).lower()
@@ -2190,9 +1982,9 @@ def compute_user_risk_profile(username: str, recipient: str, amount: float) -> d
         "geo_distance_km": geo_distance_km,
     }
 
-# ----------------------------------------------------------
-# PAGE 3: TRANSACTION  (role == "user")
-# ----------------------------------------------------------
+# ------------------------------
+# PAGE 3: TRANSACTION (role == "user")
+# ------------------------------
 if role == "user" and st.session_state.page == "transaction":
 
     if st.button("⬅ Back to Dashboard"):
@@ -2202,8 +1994,7 @@ if role == "user" and st.session_state.page == "transaction":
     st.subheader("💳 Manual Transaction")
     st.caption(
         "Enter the payment details below — behavioral, device, and merchant "
-        "risk signals are computed automatically from account history, the "
-        "same way a real fraud detection system works."
+        "risk signals are computed automatically from account history."
     )
 
     st.info(f"💰 Available Balance: **₹{get_user_balance(username):,.2f}**")
@@ -2213,7 +2004,6 @@ if role == "user" and st.session_state.page == "transaction":
         recipients.remove(username)
 
     scanned_recipient = st.session_state.pop("scanned_recipient", None)
-
     default_unknown = bool(scanned_recipient and scanned_recipient not in recipients)
 
     if scanned_recipient:
@@ -2260,9 +2050,7 @@ if role == "user" and st.session_state.page == "transaction":
             st.stop()
 
         recipient = recipient.strip()
-
         risk_profile = compute_user_risk_profile(username, recipient, amount)
-
         transaction_id = generate_id("TXN")
 
         txn = {
@@ -2278,12 +2066,8 @@ if role == "user" and st.session_state.page == "transaction":
             **risk_profile,
         }
 
-        # --------------------------------------------------
-        # SEND TRANSACTION TO FLASK FRAUD API
-        # --------------------------------------------------
         api_result = predict_transaction_api(txn)
 
-        # Do not continue if the fraud decision could not be made.
         if not api_result.get("success", False):
             st.error(
                 "❌ Transaction could not be approved because "
@@ -2297,26 +2081,14 @@ if role == "user" and st.session_state.page == "transaction":
             )
             st.stop()
 
-        # --------------------------------------------------
-        # STORE THE COMPLETE API DECISION
-        # --------------------------------------------------
         decision = normalized_api_decision(api_result)
         prob = decision["probability"]
 
         risk_level = api_result.get("risk_level", decision["risk_level"])
-        transaction_status = api_result.get(
-            "transaction_status", "UNKNOWN"
-        )
-        payment_status = api_result.get(
-            "payment_status", "UNKNOWN"
-        )
-        receiver_credited = bool(
-            api_result.get("receiver_credited", False)
-        )
-        api_message = api_result.get(
-            "message",
-            "Transaction processed."
-        )
+        transaction_status = api_result.get("transaction_status", "UNKNOWN")
+        payment_status = api_result.get("payment_status", "UNKNOWN")
+        receiver_credited = bool(api_result.get("receiver_credited", False))
+        api_message = api_result.get("message", "Transaction processed.")
 
         txn["fraud_probability"] = decision["probability_percent"]
         txn["fraud_flag"] = decision["fraud_flag"]
@@ -2327,29 +2099,17 @@ if role == "user" and st.session_state.page == "transaction":
         txn["receiver_credited"] = receiver_credited
         txn["api_message"] = api_message
 
-        # --------------------------------------------------
-        # MOVE REAL BALANCE — only if the API approved the payment.
-        # A blocked/fraudulent transaction never touches account balances.
-        # --------------------------------------------------
         if transaction_status == "APPROVED":
             moved = transfer_balance(username, recipient, float(txn["amount"]))
             if not moved:
-                # Balance changed between the pre-check and now (e.g. two
-                # tabs open) — fail safe rather than silently overdraw.
                 txn["transaction_status"] = "NOT_EXECUTED"
                 txn["payment_status"] = "NOT_EXECUTED"
                 txn["receiver_credited"] = False
                 st.error("Transaction was approved but could not be executed — insufficient balance at the time of transfer.")
 
-        # --------------------------------------------------
-        # SAVE AUDIT / USER HISTORY
-        # --------------------------------------------------
         append_fraud_alert(txn)
 
-        analysis = explain_transaction(
-            txn,
-            txn["fraud_probability"]
-        )
+        analysis = explain_transaction(txn, txn["fraud_probability"])
         if isinstance(analysis, dict):
             analysis["probability"] = float(txn["fraud_probability"])
 
@@ -2358,13 +2118,9 @@ if role == "user" and st.session_state.page == "transaction":
         if recipient in registered_users():
             append_user_history(recipient, txn)
 
-        # --------------------------------------------------
-        # SMS + WHATSAPP: tell the sender AND the receiver
-        # --------------------------------------------------
         is_external = recipient.strip().lower() not in {u.lower() for u in registered_users()}
         alert_results = []
 
-        # 1) message to the SENDER: "you are transferring Rs. X to <receiver>"
         sender_phone = resolve_phone(username)
         if sender_phone:
             sender_msg = build_alert_message(
@@ -2380,8 +2136,6 @@ if role == "user" and st.session_state.page == "transaction":
         else:
             alert_results.append((False, f"No mobile number saved for sender {username} - add it in 'Alert contact number'"))
 
-        # 2) message to the RECEIVER: "you have received Rs. X from <sender>"
-        #    (only when the money was actually sent)
         if txn["transaction_status"] == "APPROVED":
             receiver_phone = resolve_phone(recipient)
             if receiver_phone:
@@ -2395,22 +2149,14 @@ if role == "user" and st.session_state.page == "transaction":
             else:
                 alert_results.append((False, f"No mobile number for receiver {recipient} - they must save one in 'Alert contact number'"))
 
-        for _ok, _msg in alert_results:   # results go to alert_log.txt, not to the screen
+        for _ok, _msg in alert_results:
             log_event(f"{'OK  ' if _ok else 'FAIL'} {_msg}")
 
-        # --------------------------------------------------
-        # LIVE STREAM RECORD
-        # --------------------------------------------------
         st.session_state.GLOBAL_STREAM.insert(0, txn)
 
         if len(st.session_state.GLOBAL_STREAM) > MAX_STREAM_LEN:
-            st.session_state.GLOBAL_STREAM = (
-                st.session_state.GLOBAL_STREAM[:MAX_STREAM_LEN]
-            )
+            st.session_state.GLOBAL_STREAM = st.session_state.GLOBAL_STREAM[:MAX_STREAM_LEN]
 
-        # --------------------------------------------------
-        # SAVE RESULT FOR RESULT PAGE
-        # --------------------------------------------------
         st.session_state.last_txn = txn
         st.session_state.last_analysis = analysis
         st.session_state.last_risk_profile = risk_profile
@@ -2420,7 +2166,7 @@ if role == "user" and st.session_state.page == "transaction":
     st.stop()
 
 # ----------------------------------------------------------
-# PAGE 4: RESULT  (role == "user")
+# PAGE 4: RESULT (role == "user")
 # ----------------------------------------------------------
 if role == "user" and st.session_state.page == "result":
 
@@ -2463,33 +2209,16 @@ if role == "user" and st.session_state.page == "result":
         st.metric("🚩 Verdict", txn["fraud_flag"])
 
     st.progress(min(int(analysis["probability"]), 100))
-
     st.caption(f"💳 Your balance after this transaction: ₹{get_user_balance(username):,.2f}")
 
-    # ------------------------------------------------------
-    # API TRANSACTION DECISION
-    # ------------------------------------------------------
     st.markdown("### 🔐 Transaction Decision")
-
     d1, d2, d3 = st.columns(3)
-
     with d1:
-        st.metric(
-            "Risk Level",
-            txn.get("risk_level", "UNKNOWN")
-        )
-
+        st.metric("Risk Level", txn.get("risk_level", "UNKNOWN"))
     with d2:
-        st.metric(
-            "Transaction Status",
-            txn.get("transaction_status", "UNKNOWN")
-        )
-
+        st.metric("Transaction Status", txn.get("transaction_status", "UNKNOWN"))
     with d3:
-        st.metric(
-            "Payment Status",
-            txn.get("payment_status", "UNKNOWN")
-        )
+        st.metric("Payment Status", txn.get("payment_status", "UNKNOWN"))
 
     if txn.get("transaction_status") == "BLOCKED":
         st.markdown(
@@ -2503,11 +2232,7 @@ if role == "user" and st.session_state.page == "result":
             unsafe_allow_html=True,
         )
     elif txn.get("transaction_status") == "APPROVED":
-        receiver_text = (
-            "YES (simulation only)"
-            if txn.get("receiver_credited")
-            else "NO — external/unregistered recipient"
-        )
+        receiver_text = "YES (simulation only)" if txn.get("receiver_credited") else "NO — external/unregistered recipient"
         st.markdown(
             f"""
             <div class="alvan-status-card" style="border-left-color:#16A34A;">
@@ -2519,15 +2244,10 @@ if role == "user" and st.session_state.page == "result":
             unsafe_allow_html=True,
         )
 
-    st.caption(
-        "Simulation mode: this prototype does not transfer real money "
-        "through the UPI network."
-    )
+    st.caption("Simulation mode: this prototype does not transfer real money through the UPI network.")
 
     if txn.get("api_message"):
-        st.write(
-            f"**System message:** {txn['api_message']}"
-        )
+        st.write(f"**System message:** {txn['api_message']}")
 
     is_blocked = txn.get("transaction_status") == "BLOCKED"
 
@@ -2591,7 +2311,7 @@ if role == "user" and st.session_state.page == "result":
             st.session_state.show_chat_widget = not st.session_state.show_chat_widget
             st.rerun()
 
-    user_query = None   # always defined, even when the chat box is closed
+    user_query = None
 
     if st.session_state.show_chat_widget:
         with st.container(border=True):
@@ -2605,7 +2325,6 @@ if role == "user" and st.session_state.page == "result":
 
         user_query = st.chat_input("e.g. Why hasn't the receiver gotten my money?")
 
-        # ---------- VOICE SEARCH ----------
         st.session_state.setdefault("voice_counter", 0)
         st.caption("🎤 Or speak your question:")
         voice_clip = st.audio_input(
@@ -2620,7 +2339,6 @@ if role == "user" and st.session_state.page == "result":
             else:
                 st.session_state.voice_counter += 1
                 user_query = spoken_text
-        # ----------------------------------
 
     if user_query:
         st.session_state.chat_history.append(("user", user_query))
@@ -2631,8 +2349,7 @@ if role == "user" and st.session_state.page == "result":
     st.stop()
 
 # ----------------------------------------------------------
-# PAGE 4b: EXPLANATION  (role == "user", separate page for
-# "why did the AI make this prediction" + SHAP)
+# PAGE 4b: EXPLANATION (role == "user")
 # ----------------------------------------------------------
 if role == "user" and st.session_state.page == "explanation":
 
@@ -2700,8 +2417,7 @@ if role == "user" and st.session_state.page == "explanation":
         st.write("### 🍋 LIME Feature Contributions")
         st.caption(
             "An independent explanation method, computed separately from SHAP, "
-            "for the same LightGBM prediction — useful for cross-checking that "
-            "both methods agree on what drove the decision."
+            "for the same LightGBM prediction."
         )
 
         if lime_result:
@@ -2769,11 +2485,6 @@ if role == "user" and st.session_state.page == "explanation":
             unsafe_allow_html=True,
         )
 
-        if recommendation["methods_agree"]:
-            st.caption("✅ SHAP and LIME agree on the top risk driver for this transaction — increases confidence in this recommendation.")
-        else:
-            st.caption("ℹ️ SHAP and LIME highlight different top factors — recommendation is based primarily on the overall fraud probability and rule-based signals.")
-
     st.markdown("---")
     if st.button("➡ Back to Result Summary", use_container_width=True):
         st.session_state.page = "result"
@@ -2782,7 +2493,7 @@ if role == "user" and st.session_state.page == "explanation":
     st.stop()
 
 # ----------------------------------------------------------
-# PAGE 5: HISTORY  (role == "user")
+# PAGE 5: HISTORY (role == "user")
 # ----------------------------------------------------------
 if role == "user" and st.session_state.page == "history":
 
@@ -2807,8 +2518,6 @@ if role == "user" and st.session_state.page == "history":
             pass
         st.dataframe(uh_display.sort_values(by="timestamp", ascending=False).reset_index(drop=True), use_container_width=True, height=450)
 
-        # Only payments this user SENT and that were APPROVED can be
-        # recovered — matches what actually moved money.
         sent = uh[uh["user_id"] == username]
         recoverable = sent[sent["transaction_status"] == "APPROVED"].copy()
         if not recoverable.empty:
@@ -2836,7 +2545,7 @@ if role == "user" and st.session_state.page == "history":
     st.stop()
 
 # ----------------------------------------------------------
-# PAGE 3b: SCAN TO PAY  (role == "user")
+# PAGE 3b: SCAN TO PAY (role == "user")
 # ----------------------------------------------------------
 if role == "user" and st.session_state.page == "scan":
 
@@ -2845,14 +2554,9 @@ if role == "user" and st.session_state.page == "scan":
         st.rerun()
 
     st.subheader("📷 Scan to Pay — Merchant Safety Check")
-    st.caption(
-        "Scan a UPI QR code to see who you're actually paying before you send money. "
-        "This is exactly how real UPI scam prevention works — most scan-and-pay fraud "
-        "happens because people never see who's really on the other end."
-    )
+    st.caption("Scan a UPI QR code to see who you're actually paying before you send money.")
 
     scan_mode = st.radio("Choose scan method", ["📁 Upload QR Image", "📷 Live Camera Scan"], horizontal=True)
-
     scanned_data = None
 
     if scan_mode == "📁 Upload QR Image":
@@ -2863,10 +2567,7 @@ if role == "user" and st.session_state.page == "scan":
                 st.error("No QR code could be detected in that image. Try a clearer photo.")
 
     else:
-        st.info(
-            "Clicking below opens a separate camera window on this computer. Point a QR "
-            "code at your webcam — it closes automatically once detected. Press ESC to cancel."
-        )
+        st.info("Clicking below opens a separate camera window on this computer. Press ESC to cancel.")
         if st.button("🎥 Start Camera Scan"):
             with st.spinner("Opening camera... point a QR code at your webcam"):
                 scanned_data = scan_qr_live()
@@ -2888,12 +2589,10 @@ if role == "user" and st.session_state.page == "scan":
 
         st.markdown("---")
         st.write("### 🔍 Preliminary Safety Check")
-        st.caption("A quick heads-up based on this platform's history — the full fraud check runs on the Transaction page.")
-
         if trust["verdict"] == "new":
             st.warning("🟡 **New / Unverified Merchant** — no transaction history found on this platform. Proceed with caution.")
         elif trust["verdict"] == "risky":
-            st.error(f"🔴 **High Risk Merchant** — {trust['fraud_count']} of {trust['total_transactions']} past transaction(s) with this merchant were flagged as fraud.")
+            st.error(f"🔴 **High Risk Merchant** — {trust['fraud_count']} of {trust['total_transactions']} past transaction(s) were flagged as fraud.")
         else:
             st.success(f"✅ **Known Merchant** — {trust['total_transactions']} prior transaction(s) on record, no fraud history.")
 
@@ -2906,7 +2605,7 @@ if role == "user" and st.session_state.page == "scan":
     st.stop()
 
 # ----------------------------------------------------------
-# PAGE 6: RECOVER PAYMENT  (role == "user")
+# PAGE 6: RECOVER PAYMENT (role == "user")
 # ----------------------------------------------------------
 if role == "user" and st.session_state.page == "recover":
 
@@ -2932,7 +2631,6 @@ if role == "user" and st.session_state.page == "recover":
         st.stop()
 
     txn_ids = recoverable["transaction_id"].dropna().tolist()
-
     default_txn = st.session_state.get("recovery_transaction_id")
     default_index = txn_ids.index(default_txn) if default_txn in txn_ids else 0
 
@@ -2963,7 +2661,6 @@ if role == "user" and st.session_state.page == "recover":
     )
 
     if st.button("Submit Recovery Request", use_container_width=True):
-
         if not reason.strip():
             st.warning("Please enter a reason.")
             st.stop()
@@ -2975,26 +2672,12 @@ if role == "user" and st.session_state.page == "recover":
         if not result["ok"]:
             st.warning("A recovery request already exists for this transaction.")
             st.write(f"Current status: **{result['status']}**")
-            st.session_state.recovery_tracking_request_id = None
-            if st.button("📋 Track This Recovery Request", use_container_width=True):
-                st.session_state.recovery_tracking_request_id = str(
-                    load_recovery_requests().loc[
-                        (load_recovery_requests()["user_id"].astype(str) == str(username))
-                        & (load_recovery_requests()["transaction_id"].astype(str) == str(transaction["transaction_id"])),
-                        "request_id"
-                    ].iloc[-1]
-                )
-                st.session_state.page = "my_recovery"
-                st.rerun()
         else:
             st.success("✅ Recovery request submitted successfully!")
             if str(transaction["merchant_id"]) in registered_users():
                 st.info("The recipient can now view this request under their Recovery Requests page.")
             else:
-                st.info(
-                    "This recipient isn't a registered ALVAN account, so this request is logged for "
-                    "the audit trail but can't be auto-resolved — an admin can review it manually."
-                )
+                st.info("This recipient is external, so an admin can review it manually.")
             st.write(f"Request ID: **{result['request_id']}**")
             st.session_state.recovery_transaction_id = None
             st.session_state.recovery_tracking_request_id = result["request_id"]
@@ -3005,8 +2688,7 @@ if role == "user" and st.session_state.page == "recover":
     st.stop()
 
 # ----------------------------------------------------------
-# PAGE 7: MY RECOVERY STATUS  (role == "user")
-# Sender-side tracking for recovery requests submitted by this user.
+# PAGE 7: MY RECOVERY STATUS (role == "user")
 # ----------------------------------------------------------
 if role == "user" and st.session_state.page == "my_recovery":
 
@@ -3024,13 +2706,11 @@ if role == "user" and st.session_state.page == "my_recovery":
 
     if mine.empty:
         st.info("You have not submitted any recovery requests yet.")
-        st.caption("After you submit a recovery request, it will appear here with its current status.")
         st.stop()
 
     mine["amount"] = pd.to_numeric(mine["amount"], errors="coerce").fillna(0.0)
     mine = mine.sort_values("timestamp", ascending=False)
 
-    # Summary counts make the page useful at a glance.
     pending_count = int((mine["status"].astype(str).str.strip() == "Pending").sum())
     refunded_count = int((mine["status"].astype(str).str.strip() == "Refunded").sum())
     disputed_count = int((mine["status"].astype(str).str.strip() == "Disputed").sum())
@@ -3086,54 +2766,33 @@ if role == "user" and st.session_state.page == "my_recovery":
     if status == "Pending":
         if is_registered:
             status_title = "⏳ Waiting for Recipient"
-            status_text = (
-                "Your recovery request has been submitted successfully. The recipient has to "
-                "accept or reject/dispute the request before the refund can be completed."
-            )
-            deadline_value = selected.get("deadline", "")
-            time_left = format_time_remaining(deadline_value)
-            timing_text = (
-                f"24-hour recovery window is active. Deadline: **{deadline_value}**. "
-                f"Time remaining: **{time_left}**."
-            )
+            status_text = "The recipient has to accept or reject/dispute the request before refunding."
+            time_left = format_time_remaining(selected.get("deadline", ""))
+            timing_text = f"Deadline: **{selected.get('deadline', '')}**. Time remaining: **{time_left}**."
         else:
             status_title = "⏳ Pending Manual Review"
-            status_text = (
-                "The recipient is not a registered ALVAN account, so there is no recipient-side "
-                "accept/reject action in this demo. The request remains an audit/manual-review case."
-            )
-            timing_text = "The platform still tracks this as a 24-hour recovery request until an admin resolves it."
+            status_text = "Recipient is an external account; pending admin review."
+            timing_text = "Audited as a 24-hour recovery request."
         border = "#D97706"
     elif status == "Expired":
         status_title = "⏰ Recovery Window Expired"
-        status_text = (
-            "The 24-hour recovery window has elapsed, so this request can no longer be refunded through the normal flow."
-        )
-        timing_text = "No further refund will be processed automatically after the deadline passes."
+        status_text = "The 24-hour recovery window has elapsed."
+        timing_text = "No further refund can be processed automatically."
         border = "#6B7280"
     elif status == "Refunded":
         status_title = "✅ Refund Completed"
-        status_text = (
-            f"₹{amount:,.2f} has been returned to your account after the recovery request was accepted."
-        )
-        timing_text = (
-            "Demo timing: the refund is processed immediately when the registered recipient accepts "
-            "the request, and your balance is updated in the same operation."
-        )
+        status_text = f"₹{amount:,.2f} has been refunded."
+        timing_text = "Processed immediately."
         border = "#16A34A"
     elif status == "Disputed":
         status_title = "⚠️ Recovery Disputed"
-        status_text = (
-            "The recipient rejected/disputed the request, so no automatic refund was processed."
-        )
-        timing_text = (
-            "Next step in this prototype: an admin can review the request from the Admin → Recovery Requests page."
-        )
+        status_text = "The recipient rejected the refund request."
+        timing_text = "Can be escalated to admin review."
         border = "#DC2626"
     else:
         status_title = f"ℹ️ Status: {status}"
-        status_text = "The recovery request is recorded in the platform audit trail."
-        timing_text = "Check the request status again after the relevant action is taken."
+        status_text = "Recorded in platform audit trail."
+        timing_text = "Check again later."
         border = "#64748B"
 
     with st.container(border=True):
@@ -3142,7 +2801,7 @@ if role == "user" and st.session_state.page == "my_recovery":
             <div style='border-left:5px solid {border}; padding-left:16px;'>
                 <div style='font-size:20px; font-weight:700; color:#111827;'>{status_title}</div>
                 <div style='margin-top:8px; color:#374151; line-height:1.55;'>{status_text}</div>
-                <div style='margin-top:10px; color:#526071; line-height:1.5;'><strong>How long?</strong> {timing_text}</div>
+                <div style='margin-top:10px; color:#526071; line-height:1.5;'><strong>Details:</strong> {timing_text}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -3162,19 +2821,13 @@ if role == "user" and st.session_state.page == "my_recovery":
             st.write(f"**Time Left:** {format_time_remaining(selected.get('deadline'))}")
 
     st.markdown("---")
-    st.info(
-        "Important: ALVAN is a simulation for this project review. It does not send or refund real money "
-        "through the UPI network. The refund shown here updates the demo account balances only."
-    )
-
     if st.button("🔄 Refresh Recovery Status", use_container_width=True):
         st.rerun()
 
     st.stop()
 
 # ----------------------------------------------------------
-# PAGE 8: RECOVERY REQUESTS  (role == "user")
-# Requests where the current user is the recipient being asked to refund.
+# PAGE 8: RECOVERY REQUESTS (role == "user")
 # ----------------------------------------------------------
 if role == "user" and st.session_state.page == "recovery_requests":
 
@@ -3186,7 +2839,6 @@ if role == "user" and st.session_state.page == "recovery_requests":
     st.caption("Payments others have asked you to refund.")
 
     recovery = load_recovery_requests()
-
     received = recovery[
         recovery["recipient_upi"].astype(str).str.strip().str.lower()
         == username.strip().lower()
@@ -3197,13 +2849,12 @@ if role == "user" and st.session_state.page == "recovery_requests":
         st.stop()
 
     st.dataframe(received.sort_values("timestamp", ascending=False), use_container_width=True, hide_index=True)
-
     st.markdown("---")
 
     pending = received[received["status"].astype(str).str.strip().isin(["Pending", "Pending Receiver Response"])].copy()
 
     if pending.empty:
-        st.info("No pending recovery requests. Expired requests remain visible in the admin audit log.")
+        st.info("No pending recovery requests.")
         st.stop()
 
     request_ids = pending["request_id"].tolist()
@@ -3219,12 +2870,10 @@ if role == "user" and st.session_state.page == "recovery_requests":
         st.write(f"**Recovery Deadline:** {selected_request.get('deadline', 'Not set')} ({format_time_remaining(selected_request.get('deadline'))})")
 
     st.markdown("---")
-
     col1, col2 = st.columns(2)
 
     with col1:
         if st.button("✅ Accept Refund", use_container_width=True):
-
             recovery = load_recovery_requests()
             req_idx = recovery[recovery["request_id"].astype(str) == str(selected_request_id)].index
 
@@ -3232,34 +2881,25 @@ if role == "user" and st.session_state.page == "recovery_requests":
                 st.error("Recovery request not found.")
                 st.stop()
             req_idx = req_idx[0]
-
-            current_status = str(recovery.loc[req_idx, "status"]).strip()
-            if current_status != "Pending":
-                st.warning("This recovery request has already been processed.")
-                st.stop()
 
             original_sender = str(recovery.loc[req_idx, "user_id"])
             refund_amount = float(recovery.loc[req_idx, "amount"])
             transaction_id = str(recovery.loc[req_idx, "transaction_id"])
 
             refunded = reverse_transfer(original_sender, username, refund_amount)
-
             if not refunded:
                 st.error("Refund could not be processed — you don't have enough balance to refund this amount.")
                 st.stop()
 
             update_transaction_status_everywhere(transaction_id, "Refunded")
-
             recovery.loc[req_idx, "status"] = "Refunded"
             save_recovery_requests(recovery)
 
             st.success(f"Refund of ₹{refund_amount:,.2f} processed successfully!")
-            st.info("The money has been returned to the original sender.")
             st.rerun()
 
     with col2:
         if st.button("❌ Reject / Dispute", use_container_width=True):
-
             recovery = load_recovery_requests()
             req_idx = recovery[recovery["request_id"].astype(str) == str(selected_request_id)].index
 
@@ -3268,40 +2908,24 @@ if role == "user" and st.session_state.page == "recovery_requests":
                 st.stop()
             req_idx = req_idx[0]
 
-            current_status = str(recovery.loc[req_idx, "status"]).strip()
-            if current_status != "Pending":
-                st.warning("This recovery request has already been processed.")
-                st.stop()
-
             transaction_id = str(recovery.loc[req_idx, "transaction_id"])
-
             recovery.loc[req_idx, "status"] = "Disputed"
             save_recovery_requests(recovery)
             update_transaction_status_everywhere(transaction_id, "Disputed")
 
-            st.warning("Recovery request has been marked as disputed.")
+            st.warning("Recovery request marked as disputed.")
             st.rerun()
 
     st.stop()
 
 # ==========================================================
-# ADMIN VIEW — role == "admin" only, split into its own pages
+# ADMIN VIEW (role == "admin" only)
 # ==========================================================
 if role != "admin":
-    # Safety net: any role that is neither "user" nor "admin" should never
-    # see admin content. Every "user" branch above already ends in st.stop(),
-    # so reaching here with role == "user" is impossible — this is just a guard.
     st.error("Access denied.")
     st.stop()
 
 def build_transaction_graph():
-    """
-    Builds an undirected graph of every sender <-> recipient relationship
-    seen across all users' transaction history. Each edge tracks how many
-    transactions passed between that pair and how many were flagged fraud.
-    De-duplicates transactions that are stored in both the sender's and
-    recipient's own history files.
-    """
     seen = set()
     edge_data = {}
 
@@ -3335,14 +2959,7 @@ def build_transaction_graph():
 
     return G
 
-
 def detect_fraud_clusters(G, fraud_rate_threshold=0.3, min_component_size=2):
-    """
-    Finds connected components (clusters of users/merchants linked by
-    transactions) whose combined fraud rate exceeds a threshold — these
-    are candidate fraud rings, as opposed to individually-flagged
-    transactions which only look at one transaction in isolation.
-    """
     clusters = []
     for component in nx.connected_components(G):
         if len(component) < min_component_size:
@@ -3368,14 +2985,12 @@ def detect_fraud_clusters(G, fraud_rate_threshold=0.3, min_component_size=2):
     clusters.sort(key=lambda c: c["fraud_rate"], reverse=True)
     return clusters
 
-
 ADMIN_PAGES = ["overview", "users", "alerts", "recovery", "performance", "comparison", "ring", "live"]
 if st.session_state.admin_page not in ADMIN_PAGES:
     st.session_state.admin_page = "overview"
 
 st.title("ΛLVΛN — Admin Control Center")
 
-# ---- Admin top navigation ----
 nav_labels = {
     "overview": "🏠 Overview",
     "users": "👥 All Users",
@@ -3390,19 +3005,17 @@ nav_cols = st.columns(len(ADMIN_PAGES))
 for i, key in enumerate(ADMIN_PAGES):
     with nav_cols[i]:
         if st.button(nav_labels[key], use_container_width=True,
-                      type="primary" if st.session_state.admin_page == key else "secondary"):
+                     type="primary" if st.session_state.admin_page == key else "secondary"):
             st.session_state.admin_page = key
             st.rerun()
 
 st.markdown("---")
-
 users = registered_users()
 
 # ----------------------------------------------------------
 # ADMIN PAGE: OVERVIEW
 # ----------------------------------------------------------
 if st.session_state.admin_page == "overview":
-
     st.subheader("🏠 System Overview")
 
     hist_tx, hist_flagged, hist_probs = 0, 0, []
@@ -3438,14 +3051,12 @@ if st.session_state.admin_page == "overview":
         st.metric("🔄 Pending Recoveries", pending_count)
 
     st.caption(f"💰 Total balance in circulation across all accounts: ₹{total_balance:,.2f}")
-
     st.info("Use the navigation bar above to view all users, fraud alerts, recovery requests, model performance, model comparison, fraud rings, or the live transaction stream.")
 
 # ----------------------------------------------------------
 # ADMIN PAGE: ALL USERS
 # ----------------------------------------------------------
 elif st.session_state.admin_page == "users":
-
     st.subheader("👥 All Users & Their Transaction Histories")
 
     users_df = pd.DataFrame([
@@ -3469,89 +3080,45 @@ elif st.session_state.admin_page == "users":
             st.dataframe(hist_view.sort_values("timestamp", ascending=False), height=400)
 
 # ----------------------------------------------------------
-# ADMIN PAGE: FRAUD ALERTS  (audit log — only FRAUD-flagged transactions)
+# ADMIN PAGE: FRAUD ALERTS
 # ----------------------------------------------------------
 elif st.session_state.admin_page == "alerts":
-
     st.subheader("🚨 Fraud Alert Log")
-    st.caption(
-        "Every transaction flagged as FRAUD is automatically logged here for review — "
-        "a separate audit trail from normal transaction history."
-    )
-
     alerts_df = load_fraud_alerts()
 
-    total_alerts = len(alerts_df)
-    unreviewed = int((alerts_df["reviewed"] == "No").sum()) if not alerts_df.empty else 0
-    reviewed = total_alerts - unreviewed
-
-    a1, a2, a3 = st.columns(3)
-    with a1:
-        st.metric("Total Fraud Alerts", total_alerts)
-    with a2:
-        st.metric("⏳ Pending Review", unreviewed)
-    with a3:
-        st.metric("✅ Reviewed", reviewed)
-
+    st.metric("Total Fraud Alerts", len(alerts_df))
     st.markdown("---")
 
-    filter_choice = st.radio("Filter", ["All", "Pending Review", "Reviewed"], horizontal=True)
-
     if alerts_df.empty:
-        st.info("No fraud alerts have been logged yet. Alerts appear here automatically when a transaction is flagged as FRAUD.")
+        st.info("No fraud alerts have been logged yet.")
     else:
-        if filter_choice == "Pending Review":
-            filtered = alerts_df[alerts_df["reviewed"] == "No"]
-        elif filter_choice == "Reviewed":
-            filtered = alerts_df[alerts_df["reviewed"] == "Yes"]
-        else:
-            filtered = alerts_df
+        filtered = alerts_df.sort_values("timestamp", ascending=False)
+        st.write(f"**Showing {min(len(filtered), 30)} of {len(filtered)} alert(s):**")
 
-        filtered = filtered.sort_values("timestamp", ascending=False)
+        for _, row in filtered.head(30).iterrows():
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns([2.5, 3, 2, 2])
+                with c1:
+                    st.write("**Time**")
+                    st.write(row["timestamp"])
+                with c2:
+                    st.write("**User → Merchant**")
+                    st.write(f"{row['user_id']} → {row['merchant_id']}")
+                with c3:
+                    st.write("**Amount**")
+                    st.write(f"₹{float(row['amount']):,.2f}")
+                with c4:
+                    st.write("**Probability**")
+                    st.write(f"{float(row['fraud_probability']):.2f}%")
 
-        if filtered.empty:
-            st.info("No fraud alerts match this filter.")
-        else:
-            st.write(f"**Showing {min(len(filtered), 30)} of {len(filtered)} alert(s):**")
-
-            for _, row in filtered.head(30).iterrows():
-                with st.container(border=True):
-                    c1, c2, c3, c4, c5 = st.columns([2, 2.2, 1.5, 1.5, 1.5])
-                    with c1:
-                        st.write("**Time**")
-                        st.write(row["timestamp"])
-                    with c2:
-                        st.write("**User → Merchant**")
-                        st.write(f"{row['user_id']} → {row['merchant_id']}")
-                    with c3:
-                        st.write("**Amount**")
-                        st.write(f"₹{float(row['amount']):,.2f}")
-                    with c4:
-                        st.write("**Probability**")
-                        st.write(f"{float(row['fraud_probability']):.2f}%")
-                    with c5:
-                        if row["reviewed"] == "No":
-                            if st.button("Mark Reviewed", key=f"review_{row['alert_id']}"):
-                                mark_alert_reviewed(row["alert_id"])
-                                st.rerun()
-                        else:
-                            st.success("✅ Reviewed")
-
-            if len(filtered) > 30:
-                st.caption(f"Showing the latest 30 of {len(filtered)} matching alerts. Use the filter above to narrow results.")
+        if len(filtered) > 30:
+            st.caption(f"Showing the latest 30 of {len(filtered)} alerts.")
 
 # ----------------------------------------------------------
-# ADMIN PAGE: RECOVERY REQUESTS  (platform-wide audit view)
+# ADMIN PAGE: RECOVERY REQUESTS
 # ----------------------------------------------------------
 elif st.session_state.admin_page == "recovery":
-
     st.subheader("🔄 Recovery Requests — Platform Audit")
-    st.caption(
-        "Every payment-recovery request across the platform, however it was resolved. "
-        "Requests between two registered users resolve themselves once the recipient "
-        "accepts or disputes; this view is for oversight."
-    )
-
     recovery_df = load_recovery_requests()
 
     if recovery_df.empty:
@@ -3568,7 +3135,6 @@ elif st.session_state.admin_page == "recovery":
             st.metric("❌ Disputed", int((recovery_df["status"] == "Disputed").sum()))
 
         st.markdown("---")
-
         display_df = recovery_df.copy()
         display_df["amount"] = display_df["amount"].apply(lambda x: f"₹{float(x):,.2f}" if pd.notna(x) else x)
         st.dataframe(
@@ -3581,7 +3147,6 @@ elif st.session_state.admin_page == "recovery":
 # ADMIN PAGE: MODEL PERFORMANCE
 # ----------------------------------------------------------
 elif st.session_state.admin_page == "performance":
-
     st.subheader("📊 Model Performance")
     try:
         y_val = np.load(os.path.join(BASE_DIR, "models", "y_val.npy"))
@@ -3610,7 +3175,6 @@ elif st.session_state.admin_page == "performance":
             ax2.legend()
             st.pyplot(fig2)
 
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
         m1, m2, m3, m4, m5 = st.columns(5)
         with m1:
             st.metric("Accuracy", f"{accuracy_score(y_val, y_pred)*100:.2f}%")
@@ -3628,6 +3192,85 @@ elif st.session_state.admin_page == "performance":
             st.markdown("---")
             st.image(fi_path, caption="Top 20 Feature Importances (LightGBM, gain)", use_container_width=True)
 
+        # ------------------------------------------------------
+        # ADDITIONAL VISUAL ANALYTICS (Pie, Bar, Distribution)
+        # ------------------------------------------------------
+        st.markdown("---")
+        st.subheader("📈 Detailed Prediction & Risk Analytics")
+
+        # 1. Pie Chart: Prediction Outcomes (TP, FP, TN, FN)
+        tn, fp, fn, tp = cm.ravel()
+        outcome_df = pd.DataFrame({
+            "Outcome": [
+                "True Negative (Safe)", 
+                "False Positive (False Alarm)", 
+                "False Negative (Missed Fraud)", 
+                "True Positive (Caught Fraud)"
+            ],
+            "Count": [tn, fp, fn, tp]
+        })
+        fig_pie = px.pie(
+            outcome_df,
+            names="Outcome",
+            values="Count",
+            title="Model Outcome Breakdown (Pie Chart)",
+            color="Outcome",
+            color_discrete_map={
+                "True Negative (Safe)": "#3498db",
+                "True Positive (Caught Fraud)": "#e74c3c",
+                "False Positive (False Alarm)": "#f39c12",
+                "False Negative (Missed Fraud)": "#95a5a6"
+            }
+        )
+        fig_pie.update_layout(margin=dict(t=40, b=10, l=10, r=10), height=350)
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+        # 2. Bar Chart: Threshold Performance Metrics Comparison
+        metrics_df = pd.DataFrame({
+            "Metric": ["Accuracy", "Precision", "Recall", "F1 Score", "ROC AUC"],
+            "Score (%)": [
+                accuracy_score(y_val, y_pred) * 100,
+                precision_score(y_val, y_pred) * 100,
+                recall_score(y_val, y_pred) * 100,
+                f1_score(y_val, y_pred) * 100,
+                roc_auc_score(y_val, y_proba) * 100,
+            ]
+        })
+        fig_bar = px.bar(
+            metrics_df,
+            x="Metric",
+            y="Score (%)",
+            text="Score (%)",
+            title="Model Summary Metrics (Bar Chart)",
+            color="Metric",
+            color_discrete_sequence=px.colors.qualitative.Prism
+        )
+        fig_bar.update_traces(texttemplate='%{text:.2f}%', textposition='outside')
+        fig_bar.update_layout(yaxis=dict(range=[0, 115]), margin=dict(t=40, b=10, l=10, r=10), height=360)
+
+        # 3. Distribution / Histogram: Fraud Probability Spread
+        proba_df = pd.DataFrame({
+            "Fraud Probability": y_proba,
+            "Actual Label": pd.Series(y_val).map({0: "Safe", 1: "Fraud"})
+        })
+        fig_hist = px.histogram(
+            proba_df,
+            x="Fraud Probability",
+            color="Actual Label",
+            barmode="overlay",
+            nbins=40,
+            title="Predicted Probability Distribution (Histogram)",
+            color_discrete_map={"Safe": "#2ecc71", "Fraud": "#e74c3c"},
+            opacity=0.65
+        )
+        fig_hist.update_layout(margin=dict(t=40, b=10, l=10, r=10), height=360)
+
+        g_col1, g_col2 = st.columns(2)
+        with g_col1:
+            st.plotly_chart(fig_bar, use_container_width=True)
+        with g_col2:
+            st.plotly_chart(fig_hist, use_container_width=True)
+
     except FileNotFoundError:
         st.info("Model performance files are missing. Generate the dataset and train the model first:")
         st.code("python generate_dataset.py\npython train.py")
@@ -3636,7 +3279,6 @@ elif st.session_state.admin_page == "performance":
 # ADMIN PAGE: MODEL COMPARISON
 # ----------------------------------------------------------
 elif st.session_state.admin_page == "comparison":
-
     st.subheader("🏆 Model Comparison")
     try:
         comparison_df = pd.read_csv(os.path.join(BASE_DIR, "models", "model_comparison.csv"))
@@ -3663,8 +3305,6 @@ elif st.session_state.admin_page == "comparison":
 
         st.markdown("---")
         st.write("### 📈 Real Performance Gains")
-        st.caption("Computed live from your actual training results — not a static image.")
-
         try:
             lgbm_row = comparison_df[comparison_df["Model"] == "LightGBM"].iloc[0]
             rf_row = comparison_df[comparison_df["Model"] == "Random Forest"].iloc[0]
@@ -3672,59 +3312,34 @@ elif st.session_state.admin_page == "comparison":
 
             g1, g2, g3, g4 = st.columns(4)
             with g1:
-                st.metric(
-                    "AUC vs Random Forest",
-                    f"{lgbm_row['AUC']*100:.2f}%",
-                    f"+{(lgbm_row['AUC']-rf_row['AUC'])*100:.2f} pts",
-                )
+                st.metric("AUC vs Random Forest", f"{lgbm_row['AUC']*100:.2f}%", f"+{(lgbm_row['AUC']-rf_row['AUC'])*100:.2f} pts")
             with g2:
-                st.metric(
-                    "Precision vs Random Forest",
-                    f"{lgbm_row['Precision']*100:.2f}%",
-                    f"+{(lgbm_row['Precision']-rf_row['Precision'])*100:.2f} pts",
-                )
+                st.metric("Precision vs Random Forest", f"{lgbm_row['Precision']*100:.2f}%", f"+{(lgbm_row['Precision']-rf_row['Precision'])*100:.2f} pts")
             with g3:
-                st.metric(
-                    "Recall vs Random Forest",
-                    f"{lgbm_row['Recall']*100:.2f}%",
-                    f"+{(lgbm_row['Recall']-rf_row['Recall'])*100:.2f} pts",
-                )
+                st.metric("Recall vs Random Forest", f"{lgbm_row['Recall']*100:.2f}%", f"+{(lgbm_row['Recall']-rf_row['Recall'])*100:.2f} pts")
             with g4:
-                st.metric(
-                    "F1 vs Random Forest",
-                    f"{lgbm_row['F1']*100:.2f}%",
-                    f"+{(lgbm_row['F1']-rf_row['F1'])*100:.2f} pts",
-                )
+                st.metric("F1 vs Random Forest", f"{lgbm_row['F1']*100:.2f}%", f"+{(lgbm_row['F1']-rf_row['F1'])*100:.2f} pts")
 
             st.info(
-                f"Compared to the simplest baseline (Logistic Regression), **LightGBM improves "
+                f"Compared to Logistic Regression, **LightGBM improves "
                 f"AUC by {(lgbm_row['AUC']-lr_row['AUC'])*100:.2f} percentage points** and "
-                f"**Recall by {(lgbm_row['Recall']-lr_row['Recall'])*100:.2f} percentage points** — "
-                f"meaning it catches significantly more real fraud cases than a basic linear model."
+                f"**Recall by {(lgbm_row['Recall']-lr_row['Recall'])*100:.2f} percentage points**."
             )
         except (KeyError, IndexError):
-            st.warning("Could not compute comparison deltas — check that model_comparison.csv has all three model rows.")
+            st.warning("Could not compute comparison deltas — check model_comparison.csv.")
 
     except FileNotFoundError:
-        st.warning("Run the updated train.py first to generate model comparison data.")
+        st.warning("Run train.py first to generate model comparison data.")
 
 # ----------------------------------------------------------
-# ADMIN PAGE: FRAUD RING DETECTOR  (graph-based cluster analysis)
+# ADMIN PAGE: FRAUD RING DETECTOR
 # ----------------------------------------------------------
 elif st.session_state.admin_page == "ring":
-
     st.subheader("🕸️ Fraud Ring Detector")
-    st.caption(
-        "Instead of scoring one transaction at a time, this builds a graph of every "
-        "sender ↔ recipient relationship across the whole platform and looks for "
-        "connected clusters with an abnormally high combined fraud rate — a pattern "
-        "individual transaction scoring alone can't see."
-    )
-
     G = build_transaction_graph()
 
     if G.number_of_edges() == 0:
-        st.info("Not enough transaction data yet to build a relationship graph. Send a few transactions first.")
+        st.info("Not enough transaction data yet to build a relationship graph.")
     else:
         clusters = detect_fraud_clusters(G)
         suspicious = [c for c in clusters if c["suspicious"]]
@@ -3738,12 +3353,7 @@ elif st.session_state.admin_page == "ring":
             st.metric("🚨 Suspicious clusters", len(suspicious))
 
         st.markdown("---")
-
-        # ------------------------------------------------------
-        # GRAPH VISUALIZATION
-        # ------------------------------------------------------
         st.write("### 🔗 Transaction Relationship Graph")
-
         suspicious_members = set()
         for c in suspicious:
             suspicious_members.update(c["members"])
@@ -3753,10 +3363,7 @@ elif st.session_state.admin_page == "ring":
             pos = nx.spring_layout(G, seed=42, k=0.6)
 
             node_colors = ["#e74c3c" if n in suspicious_members else "#4FC3F7" for n in G.nodes()]
-            edge_colors = [
-                "#e74c3c" if G[u][v]["fraud_count"] > 0 else "#3a5a80"
-                for u, v in G.edges()
-            ]
+            edge_colors = ["#e74c3c" if G[u][v]["fraud_count"] > 0 else "#3a5a80" for u, v in G.edges()]
             edge_widths = [1 + G[u][v]["weight"] * 0.5 for u, v in G.edges()]
 
             nx.draw_networkx_edges(G, pos, ax=ax, edge_color=edge_colors, width=edge_widths, alpha=0.6)
@@ -3771,12 +3378,7 @@ elif st.session_state.admin_page == "ring":
             st.warning(f"Could not render graph: {e}")
 
         st.markdown("---")
-
-        # ------------------------------------------------------
-        # CLUSTER TABLE
-        # ------------------------------------------------------
         st.write("### 📋 Detected Clusters")
-
         if not clusters:
             st.info("No multi-account clusters detected yet.")
         else:
@@ -3803,14 +3405,13 @@ elif st.session_state.admin_page == "ring":
                         st.write("**Fraud Rate**")
                         st.write(f"{c['fraud_rate']*100:.1f}%")
                     if c["suspicious"]:
-                        st.error("🚨 Flagged as a suspicious cluster — recommend investigating this group as a potential fraud ring.")
+                        st.error("🚨 Flagged as a suspicious cluster.")
                     st.markdown("</div>", unsafe_allow_html=True)
 
 # ----------------------------------------------------------
-# ADMIN PAGE: LIVE STREAM  (must be the last page — infinite loop)
+# ADMIN PAGE: LIVE STREAM
 # ----------------------------------------------------------
 elif st.session_state.admin_page == "live":
-
     st.subheader("📡 Live Transaction Stream (updates every 5s)")
 
     if not st.session_state.stream_started:

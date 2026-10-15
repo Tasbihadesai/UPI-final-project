@@ -36,3 +36,11 @@
 2026-10-15 13:52:10  FAIL To sender swathi: no valid 10-digit phone saved for this user (save it in 'Alert contact details')
 2026-10-15 13:52:10  FAIL To receiver 8147996799: sms not sent: add FAST2SMS_KEY in alert_config.json
 2026-10-15 13:52:10  FAIL To receiver 8147996799: whatsapp not sent: add TWILIO_SID and TWILIO_TOKEN in alert_config.json
+2026-10-15 17:25:34  sms-app: opening Messages app for 6363349820
+2026-10-15 17:25:34  FAIL To sender sana: no valid 10-digit phone saved for this user (save it in 'Alert contact details')
+2026-10-15 17:25:34  FAIL To sender sana: no valid 10-digit phone saved for this user (save it in 'Alert contact details')
+2026-10-15 17:25:34  OK   To receiver khalid: sms is being sent to 6363349820 through the Windows Messages app (Phone Link) - it needs your phone paired in Phone Link; don't touch the keyboard for ~15 seconds
+2026-10-15 17:25:34  OK   To receiver khalid: whatsapp is being sent to 6363349820 through the WhatsApp desktop app - it will open and send by itself in ~10 seconds; don't click or type meanwhile
+2026-10-15 17:25:46  sms-app: pressed Enter (message should be sent)
+2026-10-15 17:25:50  desktop: opening WhatsApp chat for 6363349820
+2026-10-15 17:26:03  desktop: pressed Enter (message should be sent)
